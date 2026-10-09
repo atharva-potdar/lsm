@@ -46,7 +46,9 @@ impl SkipList {
 
                 // SAFETY: The next node must exist since it is not null.
                 let next_node = unsafe { next_shared.as_ref().expect("next is not null") };
-                if next_node.key.as_slice() < search_key {
+                if next_node.key.as_slice() == search_key {
+                    return Some(next_node.value.as_slice());
+                } else if next_node.key.as_slice() < search_key {
                     current_node = next_node;
                 } else {
                     break;
