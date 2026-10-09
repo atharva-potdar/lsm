@@ -1,5 +1,7 @@
+use std::iter::Skip;
 use crossbeam_epoch::Guard;
 use std::sync::atomic::Ordering;
+use rand::RngExt;
 
 struct SkipListNode {
     key: Vec<u8>,
@@ -67,6 +69,77 @@ impl SkipList {
             Some(next_node.value.as_slice())
         } else {
             None
+        }
+    }
+
+    pub fn put<'g>(&'g self, key: Vec<u8>, value: Vec<u8>, guard: &'g Guard) {
+        let mut update: [crossbeam_epoch::Shared<SkipListNode>; 32] = [crossbeam_epoch::Shared::null(); 32];
+
+        let mut current_shared = self.head.load(Ordering::Acquire, guard);
+
+        for level in (0..32).rev() {
+            loop {
+                // SAFETY: Dummy head or previously visited node is valid
+                let current_node = unsafe { current_shared.as_ref().expect("node exists") };
+
+                let next_shared = current_node.next[level].load(Ordering::Acquire, guard);
+                if next_shared.is_null() {
+                    break;
+                }
+
+                let next_node = unsafe { next_shared.as_ref().unwrap() };
+                if next_node.key.as_slice() < key.as_slice() {
+                    current_shared = next_shared;
+                } else {
+                    break;
+                }
+            }
+            update[level] = current_shared;
+        }
+
+        let r = rand::rng().random::<u32>();
+        let zeros = r.trailing_zeros();
+        let height = (zeros + 1).min(32) as usize;
+        let new_node = crossbeam_epoch::Owned::new(SkipListNode::new(key, value, height))
+            .into_shared(guard);
+        let my_key = unsafe { new_node.as_ref().unwrap() }.key.as_slice();
+
+        for level in 0..height {
+            let mut prev_node = unsafe { update[level].as_ref().unwrap() };
+            let mut next_shared = prev_node.next[level].load(Ordering::Acquire, guard);
+
+            loop {
+                unsafe { new_node.as_ref().unwrap() }.next[level].store(next_shared, Ordering::Relaxed);
+                match prev_node.next[level].compare_exchange(
+                    next_shared,
+                    new_node,
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                    guard,
+                ) {
+                    Ok(_) => break,
+                    Err(err) => {
+                        let actual_node = unsafe { err.current.as_ref().unwrap() };
+
+                        if actual_node.key.as_slice() >= my_key {
+                            next_shared = err.current;
+                        } else {
+                            prev_node = actual_node;
+                            loop {
+                                next_shared = prev_node.next[level].load(Ordering::Acquire, guard);
+                                if next_shared.is_null() { break; }
+
+                                let next_node = unsafe { next_shared.as_ref().unwrap() };
+                                if next_node.key.as_slice() < my_key {
+                                    prev_node = next_node;
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }

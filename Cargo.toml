@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 crossbeam-epoch = "0.9.21"
+rand = "0.10.3"
 
 [lints.clippy]
 all = "warn"
