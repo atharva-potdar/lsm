@@ -64,7 +64,7 @@ impl SkipList {
 
         // SAFETY: The next node must exist since it is not null.
         let next_node = unsafe { next_shared.as_ref().expect("next is not null") };
-        return Some((next_node.key.as_slice(), next_node.value.as_slice()));
+        Some((next_node.key.as_slice(), next_node.value.as_slice()))
     }
 
     pub fn put<'g>(&'g self, key: Vec<u8>, value: Vec<u8>, guard: &'g Guard) {

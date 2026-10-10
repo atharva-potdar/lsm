@@ -1,3 +1,3 @@
-mod skiplist;
-mod memtable;
 mod core;
+mod memtable;
+mod skiplist;

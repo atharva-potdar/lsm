@@ -1,7 +1,7 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
-use crossbeam_epoch::Guard;
-use crate::memory::{skiplist, core};
 use crate::memory::core::encode_internal_key;
+use crate::memory::skiplist;
+use crossbeam_epoch::Guard;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub struct MemTable {
     skip_list: skiplist::SkipList,
@@ -18,7 +18,8 @@ impl MemTable {
 
     pub fn put(&self, key: &[u8], value: &[u8], lsn: u64) {
         let added_size = key.len() + value.len();
-        self.approximate_size.fetch_add(added_size, Ordering::Relaxed);
+        self.approximate_size
+            .fetch_add(added_size, Ordering::Relaxed);
         let guard = crossbeam_epoch::pin();
         let internal_key = encode_internal_key(key, lsn, 1);
         self.skip_list.put(internal_key, value.to_vec(), &guard);
@@ -42,7 +43,8 @@ impl MemTable {
 
     pub fn delete(&self, key: &[u8], lsn: u64) {
         let added_size = key.len();
-        self.approximate_size.fetch_add(added_size, Ordering::Relaxed);
+        self.approximate_size
+            .fetch_add(added_size, Ordering::Relaxed);
 
         let internal_key = encode_internal_key(key, lsn, 0);
         let guard = crossbeam_epoch::pin();
@@ -73,7 +75,7 @@ mod tests {
 
         memtable.put(b"banana", b"yellow", 3);
         assert_eq!(memtable.get(b"banana", &guard), Some(b"yellow".as_slice()));
-        
+
         memtable.delete(b"apple", 4);
         assert_eq!(memtable.get(b"apple", &guard), None);
         assert_eq!(memtable.get(b"banana", &guard), Some(b"yellow".as_slice()));
