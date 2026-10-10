@@ -79,3 +79,39 @@ impl BlockBuilder {
         &self.buffer
     }
 }
+
+pub struct Block {
+    data: Vec<u8>,
+    restart_offset: usize,
+    num_restarts: usize,
+}
+
+impl Block {
+    const fn decode_varint(data: &[u8], mut offset: usize) -> (u32, usize) {
+        let mut result: u32 = 0;
+        let mut shift = 0;
+
+        loop {
+            let byte = data[offset];
+            offset += 1;
+            let data = byte & 0x7F;
+            result |= (data as u32) << shift;
+            if (byte & 0x80) == 0 {
+                break;
+            }
+            shift += 7;
+        }
+
+        (result, offset)
+    }
+
+    pub fn new(data: Vec<u8>) -> Self {
+        let num_restarts = u32::from_le_bytes(data[data.len() - 4..].try_into().unwrap()) as usize;
+        let restart_offset = data.len() - 4 - num_restarts * 4;
+        Self {
+            data,
+            restart_offset,
+            num_restarts,
+        }
+    }
+}
