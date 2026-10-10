@@ -34,7 +34,7 @@ impl SkipList {
         }
     }
 
-    pub fn get<'g>(&'g self, search_key: &[u8], guard: &'g Guard) -> Option<&'g [u8]> {
+    pub fn seek<'g>(&'g self, search_key: &[u8], guard: &'g Guard) -> Option<(&'g [u8], &'g [u8])> {
         let head_shared = self.head.load(Ordering::Acquire, guard);
 
         // SAFETY: The head node is instantiated on creation and never dropped or mutated, simply a dummy.
@@ -49,10 +49,10 @@ impl SkipList {
 
                 // SAFETY: The next node must exist since it is not null.
                 let next_node = unsafe { next_shared.as_ref().expect("next is not null") };
-                match next_node.key.as_slice().cmp(search_key) {
-                    std::cmp::Ordering::Equal => return Some(next_node.value.as_slice()),
-                    std::cmp::Ordering::Less => current_node = next_node,
-                    std::cmp::Ordering::Greater => break,
+                if next_node.key.as_slice() < search_key {
+                    current_node = next_node;
+                } else {
+                    break;
                 }
             }
         }
@@ -64,11 +64,7 @@ impl SkipList {
 
         // SAFETY: The next node must exist since it is not null.
         let next_node = unsafe { next_shared.as_ref().expect("next is not null") };
-        if next_node.key.as_slice() == search_key {
-            Some(next_node.value.as_slice())
-        } else {
-            None
-        }
+        return Some((next_node.key.as_slice(), next_node.value.as_slice()));
     }
 
     pub fn put<'g>(&'g self, key: Vec<u8>, value: Vec<u8>, guard: &'g Guard) {
@@ -154,25 +150,24 @@ mod tests {
     use crossbeam_epoch::pin;
 
     #[test]
-    fn test_skiplist_basic_operations() {
+    fn test_skiplist_seek() {
         let list = SkipList::new();
-
         let guard = pin();
 
-        list.put(b"zebra".to_vec(), b"stripes".to_vec(), &guard);
-        list.put(b"apple".to_vec(), b"red".to_vec(), &guard);
-        list.put(b"monkey".to_vec(), b"banana".to_vec(), &guard);
+        list.put(b"apple\x01".to_vec(), b"new_apple".to_vec(), &guard);
+        list.put(b"apple\x02".to_vec(), b"old_apple".to_vec(), &guard);
+        list.put(b"zebra\x01".to_vec(), b"new_zebra".to_vec(), &guard);
 
-        assert_eq!(list.get(b"apple", &guard), Some(b"red".as_slice()));
-        assert_eq!(list.get(b"zebra", &guard), Some(b"stripes".as_slice()));
-        assert_eq!(list.get(b"monkey", &guard), Some(b"banana".as_slice()));
+        // Test 1: Seek "apple". It should land on the newest one (\x01).
+        let (k, v) = list.seek(b"apple", &guard).unwrap();
+        assert_eq!(k, b"apple\x01".as_slice());
+        assert_eq!(v, b"new_apple".as_slice());
 
-        assert_eq!(list.get(b"ghost", &guard), None);
+        // Test 2: Seek "banana". It should overshoot and land on "zebra".
+        let (k, _) = list.seek(b"banana", &guard).unwrap();
+        assert_eq!(k, b"zebra\x01".as_slice());
 
-        list.put(b"aardvark".to_vec(), b"ant".to_vec(), &guard);
-        list.put(b"zulu".to_vec(), b"end".to_vec(), &guard);
-
-        assert_eq!(list.get(b"aardvark", &guard), Some(b"ant".as_slice()));
-        assert_eq!(list.get(b"zulu", &guard), Some(b"end".as_slice()));
+        // Test 3: Seek past the end of the database
+        assert_eq!(list.seek(b"zulu", &guard), None);
     }
 }
