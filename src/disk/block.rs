@@ -233,3 +233,44 @@ impl<'a> BlockIterator<'a> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_block_builder_and_iterator() {
+        let mut builder = BlockBuilder::new(2);
+        builder.add(b"apple", b"v1");
+        builder.add(b"application", b"v2");
+        builder.add(b"banana", b"v3");
+
+        let raw_block = builder.finish().to_vec();
+        let block = Block::new(raw_block);
+        let mut iter = BlockIterator::new(&block);
+
+        iter.seek_to_first();
+        assert_eq!(iter.key(), Some(&b"apple"[..]));
+        assert_eq!(iter.value(), Some(&b"v1"[..]));
+
+        iter.next();
+        assert_eq!(iter.key(), Some(&b"application"[..]));
+        assert_eq!(iter.value(), Some(&b"v2"[..]));
+
+        iter.next();
+        assert_eq!(iter.key(), Some(&b"banana"[..]));
+        assert_eq!(iter.value(), Some(&b"v3"[..]));
+
+        iter.next();
+        assert_eq!(iter.key(), None);
+        assert_eq!(iter.value(), None);
+        assert!(!iter.is_valid());
+
+        iter.seek(b"application");
+        assert_eq!(iter.key(), Some(&b"application"[..]));
+        assert_eq!(iter.value(), Some(&b"v2"[..]));
+        iter.seek(b"app");
+        assert_eq!(iter.key(), Some(&b"apple"[..]));
+        assert_eq!(iter.value(), Some(&b"v1"[..]));
+    }
+}
