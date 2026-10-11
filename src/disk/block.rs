@@ -3,6 +3,9 @@
     clippy::cast_sign_loss,
     clippy::cast_precision_loss
 )]
+
+use std::cmp::Ordering;
+
 pub struct BlockBuilder {
     buffer: Vec<u8>,
     restart_points: Vec<u32>,
@@ -112,6 +115,117 @@ impl Block {
             data,
             restart_offset,
             num_restarts,
+        }
+    }
+}
+
+pub struct BlockIterator<'a> {
+    block: &'a Block,
+    offset: usize,
+    next_offset: usize,
+    key: Vec<u8>,
+    value: &'a [u8],
+}
+
+impl<'a> BlockIterator<'a> {
+    pub const fn new(block: &'a Block) -> Self {
+        Self {
+            block,
+            offset: block.restart_offset,
+            next_offset: 0,
+            key: Vec::new(),
+            value: &[],
+        }
+    }
+
+    pub const fn is_valid(&self) -> bool {
+        self.offset < self.block.restart_offset
+    }
+
+    fn decode_entry_at(&mut self, offset: usize) {
+        let (shared_len, offset1) = Block::decode_varint(&self.block.data, offset);
+        let (unshared_len, offset2) = Block::decode_varint(&self.block.data, offset1);
+        let (value_len, offset3) = Block::decode_varint(&self.block.data, offset2);
+        let unshared_key = &self.block.data[offset3..offset3 + unshared_len as usize];
+        self.key.truncate(shared_len as usize);
+        self.key.extend_from_slice(unshared_key);
+        let val_start = offset3 + unshared_len as usize;
+        let val_end = val_start + value_len as usize;
+        self.value = &self.block.data[val_start..val_end];
+
+        self.offset = offset;
+        self.next_offset = val_end;
+    }
+
+    pub fn seek_to_first(&mut self) {
+        if self.block.restart_offset == 0 {
+            return;
+        }
+
+        self.decode_entry_at(0);
+    }
+
+    pub fn next(&mut self) {
+        if self.next_offset >= self.block.restart_offset {
+            self.offset = self.next_offset;
+            return;
+        }
+
+        self.decode_entry_at(self.next_offset);
+    }
+
+    pub fn seek(&mut self, target: &[u8]) {
+        if self.block.restart_offset == 0 {
+            return;
+        }
+
+        let mut left = 0;
+        let mut right = self.block.num_restarts.saturating_sub(1);
+
+        while left < right {
+            let mid = (left + right).div_ceil(2);
+            let bytes = &self.block.data
+                [self.block.restart_offset + mid * 4..self.block.restart_offset + mid * 4 + 4];
+            let entry_offset = u32::from_le_bytes(bytes.try_into().unwrap()) as usize;
+
+            self.decode_entry_at(entry_offset);
+
+            match self.key.as_slice().cmp(target) {
+                Ordering::Equal => {
+                    return;
+                }
+                Ordering::Less => {
+                    left = mid;
+                }
+                Ordering::Greater => {
+                    right = mid - 1;
+                }
+            }
+        }
+
+        let bytes = &self.block.data
+            [self.block.restart_offset + left * 4..self.block.restart_offset + left * 4 + 4];
+        let entry_offset = u32::from_le_bytes(bytes.try_into().unwrap()) as usize;
+        self.decode_entry_at(entry_offset);
+
+        while self.is_valid() && self.key.as_slice() < target {
+            self.next();
+        }
+    }
+
+    pub fn key(&self) -> Option<&[u8]> {
+        if self.is_valid() {
+            Some(&self.key)
+        } else {
+            None
+        }
+    }
+
+    pub const fn value(&self) -> Option<&[u8]> {
+        if self.is_valid() {
+            Some(self.value)
+        } else {
+            None
         }
     }
 }
