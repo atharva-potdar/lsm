@@ -144,6 +144,19 @@ impl SkipList {
     }
 }
 
+impl Drop for SkipList {
+    fn drop(&mut self) {
+        let guard = crossbeam_epoch::pin();
+        let mut curr = self.head.load(Ordering::Relaxed, &guard);
+        while !curr.is_null() {
+            let node = unsafe { curr.as_ref().unwrap() };
+            let next = node.next[0].load(Ordering::Acquire, &guard);
+            unsafe { guard.defer_destroy(curr); }
+            curr = next;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
