@@ -99,11 +99,17 @@ impl Block {
         let mut shift = 0;
 
         loop {
+            if offset >= data.len() {
+                break;
+            }
+
             let byte = data[offset];
             offset += 1;
-            let data = byte & 0x7F;
-            result |= (data as u32) << shift;
-            if (byte & 0x80) == 0 {
+            let val = byte & 0x7F;
+            result |= (val as u32) << shift;
+
+            // shift can never exceed 28 for an u32
+            if (byte & 0x80) == 0 || shift >= 28 {
                 break;
             }
             shift += 7;
