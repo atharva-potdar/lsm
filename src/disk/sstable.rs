@@ -81,6 +81,7 @@ pub struct SSTableWriter<W: std::io::Write> {
     offset: u64,
     block_size: usize,
     data_restart_interval: usize,
+    bits_per_key: usize
 }
 
 impl<W: std::io::Write> SSTableWriter<W> {
@@ -89,6 +90,7 @@ impl<W: std::io::Write> SSTableWriter<W> {
         block_size: usize,
         data_restart_interval: usize,
         index_restart_interval: usize,
+        bits_per_key: usize
     ) -> Self {
         Self {
             writer,
@@ -99,6 +101,7 @@ impl<W: std::io::Write> SSTableWriter<W> {
             offset: 0,
             block_size,
             data_restart_interval,
+            bits_per_key
         }
     }
 
@@ -133,13 +136,14 @@ impl<W: std::io::Write> SSTableWriter<W> {
     pub fn finish(mut self) -> std::io::Result<W> {
         self.flush_data_block()?;
 
-        let mut filter = BloomFilter::new(self.key_hashes.len(), 10);
+        let mut filter = BloomFilter::new(self.key_hashes.len(), self.bits_per_key);
         for hash in &self.key_hashes {
             filter.add(*hash);
         }
         self.writer.write_all(&filter.data)?;
-        let filter_handle = BlockHandle::new(self.offset, filter.data.len() as u64);
-        self.offset += filter.data.len() as u64;
+        self.writer.write_all(&[filter.k])?;
+        let filter_handle = BlockHandle::new(self.offset, (filter.data.len() + 1) as u64);
+        self.offset += (filter.data.len() + 1) as u64;
 
         let index_bytes = self.index_builder.finish();
         self.writer.write_all(index_bytes)?;
@@ -162,7 +166,7 @@ mod tests {
     #[test]
     fn test_sstable_build_basic() {
         let buf = Vec::new();
-        let mut writer = SSTableWriter::new(buf, 4096, 16, 1);
+        let mut writer = SSTableWriter::new(buf, 4096, 16, 1, 10);
         let k1 = encode_internal_key(b"user1", 100, 1);
         let k2 = encode_internal_key(b"user2", 90, 1);
 

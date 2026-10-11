@@ -5,7 +5,7 @@
 )]
 pub struct BloomFilter {
     pub data: Vec<u8>,
-    k: u8,
+    pub k: u8,
 }
 
 impl BloomFilter {
@@ -58,6 +58,13 @@ impl BloomFilter {
         }
 
         true
+    }
+
+    pub fn from_raw(data: Vec<u8>, k: u8) -> Self {
+        Self {
+            data,
+            k
+        }
     }
 }
 
