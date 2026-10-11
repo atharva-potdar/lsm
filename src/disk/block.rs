@@ -82,7 +82,7 @@ impl BlockBuilder {
         &self.buffer
     }
 
-    pub fn estimated_size(&self) -> usize {
+    pub const fn estimated_size(&self) -> usize {
         self.buffer.len() + self.restart_points.len() * 4 + 4
     }
 }

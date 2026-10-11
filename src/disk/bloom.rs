@@ -4,7 +4,7 @@
     clippy::cast_precision_loss
 )]
 pub struct BloomFilter {
-    data: Vec<u8>,
+    pub data: Vec<u8>,
     k: u8,
 }
 
