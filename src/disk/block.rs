@@ -142,7 +142,7 @@ impl<'a> BlockIterator<'a> {
         Self {
             block,
             offset: block.restart_offset,
-            next_offset: 0,
+            next_offset: block.restart_offset,
             key: Vec::new(),
             value: &[],
         }
