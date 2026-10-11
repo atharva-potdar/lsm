@@ -122,6 +122,8 @@ impl<W: std::io::Write> SSTableWriter<W> {
     }
 
     pub fn add(&mut self, key: &[u8], value: &[u8]) -> std::io::Result<()> {
+        assert!(key.len() >= 9);
+
         if self.data_builder.estimated_size() >= self.block_size {
             self.flush_data_block()?;
         }
