@@ -28,7 +28,7 @@ impl MemTable {
     pub fn get<'g>(&'g self, user_key: &[u8], guard: &'g Guard) -> Option<&'g [u8]> {
         let (found_key, found_value) = self.skip_list.seek(user_key, guard)?;
 
-        if !found_key.starts_with(user_key) {
+        if found_key.len() < 9 || user_key != &found_key[..found_key.len() - 9] {
             return None;
         }
 
