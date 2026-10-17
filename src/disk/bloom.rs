@@ -60,11 +60,8 @@ impl BloomFilter {
         true
     }
 
-    pub fn from_raw(data: Vec<u8>, k: u8) -> Self {
-        Self {
-            data,
-            k
-        }
+    pub const fn from_raw(data: Vec<u8>, k: u8) -> Self {
+        Self { data, k }
     }
 }
 

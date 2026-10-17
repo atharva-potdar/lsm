@@ -136,7 +136,7 @@ impl Block {
         Ok(Self {
             data,
             restart_offset,
-            num_restarts
+            num_restarts,
         })
     }
 }
