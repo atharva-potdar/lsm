@@ -118,14 +118,26 @@ impl Block {
         (result, offset)
     }
 
-    pub fn new(data: Vec<u8>) -> Self {
+    pub fn decode(data: Vec<u8>) -> Result<Self, &'static str> {
+        if data.len() < 4 {
+            return Err("block too small");
+        }
+
         let num_restarts = u32::from_le_bytes(data[data.len() - 4..].try_into().unwrap()) as usize;
-        let restart_offset = data.len() - 4 - num_restarts * 4;
-        Self {
+        let trailer_size = num_restarts
+            .checked_mul(4)
+            .and_then(|t| t.checked_add(4))
+            .ok_or("trailer size overflow")?;
+        if trailer_size > data.len() {
+            return Err("trailer size exceeds block size");
+        }
+        let restart_offset = data.len() - trailer_size;
+
+        Ok(Self {
             data,
             restart_offset,
-            num_restarts,
-        }
+            num_restarts
+        })
     }
 }
 
@@ -252,7 +264,7 @@ mod tests {
         builder.add(b"banana", b"v3");
 
         let raw_block = builder.finish().to_vec();
-        let block = Block::new(raw_block);
+        let block = Block::decode(raw_block).unwrap();
         let mut iter = BlockIterator::new(&block);
 
         iter.seek_to_first();
