@@ -9,7 +9,7 @@ use crate::disk::manifest::{FileMetaData, VersionEdit, VersionSet};
 use crate::disk::merge::MergeIterator;
 use crate::disk::sstable::{SSTableWriter, SsTable};
 use crate::disk::wal::{WalReader, WalWriter};
-use crate::memory::core::{encode_internal_key, ValueResult};
+use crate::memory::core::{ValueResult, encode_internal_key};
 use crate::memory::memtable::MemTable;
 use std::collections::HashMap;
 use std::fs::File;
@@ -45,7 +45,10 @@ pub struct DB {
 
 impl DB {
     /// Opens the database, recovers from WAL if it exists, and initializes the `VersionSet`.
-    pub fn open(work_dir: impl Into<PathBuf>, memtable_capacity: usize) -> std::io::Result<Arc<Self>> {
+    pub fn open(
+        work_dir: impl Into<PathBuf>,
+        memtable_capacity: usize,
+    ) -> std::io::Result<Arc<Self>> {
         let work_dir = work_dir.into();
         std::fs::create_dir_all(&work_dir)?;
 
@@ -60,7 +63,8 @@ impl DB {
                     continue;
                 }
                 let user_key = &internal_key[..internal_key.len() - 9];
-                let lsn_bytes: [u8; 8] = internal_key[internal_key.len() - 9..internal_key.len() - 1]
+                let lsn_bytes: [u8; 8] = internal_key
+                    [internal_key.len() - 9..internal_key.len() - 1]
                     .try_into()
                     .unwrap();
                 let lsn = u64::MAX - u64::from_be_bytes(lsn_bytes);
@@ -431,7 +435,11 @@ impl DB {
 
     pub fn wait_for_compaction(&self) {
         let (tx, rx) = std::sync::mpsc::sync_channel(0);
-        if self.compaction_sender.send(CompactionSignal::Sync(tx)).is_ok() {
+        if self
+            .compaction_sender
+            .send(CompactionSignal::Sync(tx))
+            .is_ok()
+        {
             let _ = rx.recv();
         }
     }
@@ -440,7 +448,12 @@ impl DB {
 impl Drop for DB {
     fn drop(&mut self) {
         let _ = self.compaction_sender.send(CompactionSignal::Shutdown);
-        if let Some(handle) = self.compaction_handle.lock().ok().and_then(|mut l| l.take()) {
+        if let Some(handle) = self
+            .compaction_handle
+            .lock()
+            .ok()
+            .and_then(|mut l| l.take())
+        {
             let _ = handle.join();
         }
         let _ = self.clean_obsolete_files();
@@ -519,8 +532,14 @@ mod tests {
         db.put(b"long_key_01", b"long_val_01").unwrap();
         db.put(b"long_key_02", b"long_val_02").unwrap();
 
-        assert_eq!(db.get(b"long_key_01").unwrap(), Some(b"long_val_01".to_vec()));
-        assert_eq!(db.get(b"long_key_02").unwrap(), Some(b"long_val_02".to_vec()));
+        assert_eq!(
+            db.get(b"long_key_01").unwrap(),
+            Some(b"long_val_01".to_vec())
+        );
+        assert_eq!(
+            db.get(b"long_key_02").unwrap(),
+            Some(b"long_val_02".to_vec())
+        );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
@@ -621,8 +640,12 @@ mod tests {
         {
             let file = File::create(&file3_path).unwrap();
             let mut writer = SSTableWriter::new(file, 4096, 16, 1, 10);
-            writer.add(&encode_internal_key(b"key1", 1, 1), b"val1").unwrap();
-            writer.add(&encode_internal_key(b"key2", 2, 1), b"val2").unwrap();
+            writer
+                .add(&encode_internal_key(b"key1", 1, 1), b"val1")
+                .unwrap();
+            writer
+                .add(&encode_internal_key(b"key2", 2, 1), b"val2")
+                .unwrap();
             let f = writer.finish().unwrap();
             f.sync_all().unwrap();
         }
@@ -649,18 +672,35 @@ mod tests {
 
         // 6. Check the disk: 000001.sst and 000002.sst should be physically deleted.
         //    000003.sst should exist.
-        assert!(!file1_path.exists(), "000001.sst should be physically deleted");
-        assert!(!file2_path.exists(), "000002.sst should be physically deleted");
+        assert!(
+            !file1_path.exists(),
+            "000001.sst should be physically deleted"
+        );
+        assert!(
+            !file2_path.exists(),
+            "000002.sst should be physically deleted"
+        );
         assert!(file3_path.exists(), "000003.sst must exist");
 
         // 7. Re-open DB. VersionSet should correctly know that Level 1 has File 3, and Level 0 is empty.
         let db2 = DB::open(&temp_dir, 1024 * 1024).unwrap();
         {
             let state = db2.state.lock().unwrap();
-            assert_eq!(state.versions.current.files[0].len(), 0, "Level 0 should be empty");
-            assert_eq!(state.versions.current.files[1].len(), 1, "Level 1 should have 1 file");
+            assert_eq!(
+                state.versions.current.files[0].len(),
+                0,
+                "Level 0 should be empty"
+            );
+            assert_eq!(
+                state.versions.current.files[1].len(),
+                1,
+                "Level 1 should have 1 file"
+            );
             assert_eq!(state.versions.current.files[1][0].file_id, 3);
-            assert_eq!(state.versions.next_file_id, 4, "next_file_id must be MAX(1,2,3)+1 = 4");
+            assert_eq!(
+                state.versions.next_file_id, 4,
+                "next_file_id must be MAX(1,2,3)+1 = 4"
+            );
         }
 
         // Verify read path works cleanly from recovered Level 1 SSTable
@@ -696,7 +736,9 @@ mod tests {
         {
             let file = File::create(&file2_path).unwrap();
             let mut writer = SSTableWriter::new(file, 4096, 16, 1, 10);
-            writer.add(&encode_internal_key(b"alpha", 1, 1), b"1").unwrap();
+            writer
+                .add(&encode_internal_key(b"alpha", 1, 1), b"1")
+                .unwrap();
             let f = writer.finish().unwrap();
             f.sync_all().unwrap();
         }
@@ -769,21 +811,11 @@ mod tests {
             "Level 1 should contain compacted files"
         );
 
-        assert_eq!(
-            db.get(b"key_000000").unwrap(),
-            Some(b"val_000000".to_vec())
-        );
-        assert_eq!(
-            db.get(b"key_099999").unwrap(),
-            Some(b"val_099999".to_vec())
-        );
-        assert_eq!(
-            db.get(b"key_050000").unwrap(),
-            Some(b"val_050000".to_vec())
-        );
+        assert_eq!(db.get(b"key_000000").unwrap(), Some(b"val_000000".to_vec()));
+        assert_eq!(db.get(b"key_099999").unwrap(), Some(b"val_099999".to_vec()));
+        assert_eq!(db.get(b"key_050000").unwrap(), Some(b"val_050000".to_vec()));
         assert_eq!(db.get(b"nonexistent").unwrap(), None);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
-

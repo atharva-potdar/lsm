@@ -49,7 +49,10 @@ mod tests {
 
         // cmp_internal_key correctly identifies that [0x01] < [0x01, 0x02]:
         assert_eq!(cmp_internal_key(&key_a, &key_b), std::cmp::Ordering::Less);
-        assert_eq!(cmp_internal_key(&key_b, &key_a), std::cmp::Ordering::Greater);
+        assert_eq!(
+            cmp_internal_key(&key_b, &key_a),
+            std::cmp::Ordering::Greater
+        );
     }
 
     #[test]
@@ -58,7 +61,10 @@ mod tests {
         let newer = encode_internal_key(b"apple", 100, 1);
         let older = encode_internal_key(b"apple", 50, 1);
         assert_eq!(cmp_internal_key(&newer, &older), std::cmp::Ordering::Less);
-        assert_eq!(cmp_internal_key(&older, &newer), std::cmp::Ordering::Greater);
+        assert_eq!(
+            cmp_internal_key(&older, &newer),
+            std::cmp::Ordering::Greater
+        );
 
         // Put vs Delete on identical user key and LSN: op 0 (delete) sorts before op 1 (put)
         let delete = encode_internal_key(b"apple", 50, 0);

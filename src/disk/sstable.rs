@@ -8,7 +8,7 @@ use crate::disk::block::{Block, BlockBuilder, BlockIterator};
 use crate::disk::bloom::BloomFilter;
 use xxhash_rust::xxh3::xxh3_64;
 
-use crate::memory::core::{encode_internal_key, ValueResult};
+use crate::memory::core::{ValueResult, encode_internal_key};
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 
@@ -243,7 +243,8 @@ impl SsTableIterator {
 
         if let Some((next_offset, val_start, val_len)) = block.decode_entry(0, &mut self.key) {
             self.value.clear();
-            self.value.extend_from_slice(&block.data()[val_start..val_start + val_len]);
+            self.value
+                .extend_from_slice(&block.data()[val_start..val_start + val_len]);
             self.offset = 0;
             self.next_offset = next_offset;
             self.valid = true;
@@ -410,8 +411,14 @@ mod tests {
         writer.finish().unwrap();
 
         let table = SsTable::open(&path).unwrap();
-        assert_eq!(table.get(b"apple", 110).unwrap(), ValueResult::Found(b"red".to_vec()));
-        assert_eq!(table.get(b"banana", 100).unwrap(), ValueResult::Found(b"yellow".to_vec()));
+        assert_eq!(
+            table.get(b"apple", 110).unwrap(),
+            ValueResult::Found(b"red".to_vec())
+        );
+        assert_eq!(
+            table.get(b"banana", 100).unwrap(),
+            ValueResult::Found(b"yellow".to_vec())
+        );
         assert_eq!(table.get(b"banana", 110).unwrap(), ValueResult::Deleted);
         assert_eq!(table.get(b"ghost", 110).unwrap(), ValueResult::NotFound);
     }
@@ -448,4 +455,3 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 }
-

@@ -1,4 +1,4 @@
-use crate::memory::core::{encode_internal_key, ValueResult};
+use crate::memory::core::{ValueResult, encode_internal_key};
 use crate::memory::skiplist;
 use crossbeam_epoch::Guard;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -75,17 +75,29 @@ mod tests {
         let guard = pin();
 
         memtable.put(b"apple", b"red", 1);
-        assert_eq!(memtable.get(b"apple", &guard), ValueResult::Found(b"red".to_vec()));
+        assert_eq!(
+            memtable.get(b"apple", &guard),
+            ValueResult::Found(b"red".to_vec())
+        );
 
         memtable.put(b"apple", b"green", 2);
-        assert_eq!(memtable.get(b"apple", &guard), ValueResult::Found(b"green".to_vec()));
+        assert_eq!(
+            memtable.get(b"apple", &guard),
+            ValueResult::Found(b"green".to_vec())
+        );
 
         memtable.put(b"banana", b"yellow", 3);
-        assert_eq!(memtable.get(b"banana", &guard), ValueResult::Found(b"yellow".to_vec()));
+        assert_eq!(
+            memtable.get(b"banana", &guard),
+            ValueResult::Found(b"yellow".to_vec())
+        );
 
         memtable.delete(b"apple", 4);
         assert_eq!(memtable.get(b"apple", &guard), ValueResult::Deleted);
-        assert_eq!(memtable.get(b"banana", &guard), ValueResult::Found(b"yellow".to_vec()));
+        assert_eq!(
+            memtable.get(b"banana", &guard),
+            ValueResult::Found(b"yellow".to_vec())
+        );
         assert_eq!(memtable.approximate_size(), 35);
     }
 }

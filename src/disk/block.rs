@@ -119,11 +119,7 @@ impl Block {
         (result, offset)
     }
 
-    pub fn decode_entry(
-        &self,
-        offset: usize,
-        key: &mut Vec<u8>,
-    ) -> Option<(usize, usize, usize)> {
+    pub fn decode_entry(&self, offset: usize, key: &mut Vec<u8>) -> Option<(usize, usize, usize)> {
         if offset >= self.restart_offset {
             return None;
         }
@@ -201,7 +197,9 @@ impl<'a> BlockIterator<'a> {
     }
 
     fn decode_entry_at(&mut self, offset: usize) {
-        if let Some((next_offset, val_start, val_len)) = self.block.decode_entry(offset, &mut self.key) {
+        if let Some((next_offset, val_start, val_len)) =
+            self.block.decode_entry(offset, &mut self.key)
+        {
             self.value = &self.block.data[val_start..val_start + val_len];
             self.offset = offset;
             self.next_offset = next_offset;

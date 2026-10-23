@@ -125,7 +125,7 @@ pub struct Compactor {
 }
 
 impl Compactor {
-    /// Streams a `MergeIterator`, deduplicates versions, drops bottom-level tombstones, 
+    /// Streams a `MergeIterator`, deduplicates versions, drops bottom-level tombstones,
     /// and writes the output to new `SSTables`, returning a `VersionEdit`.
     #[allow(dead_code)]
     pub fn compact<I: StorageIterator>(
@@ -211,8 +211,9 @@ impl Compactor {
             if current_writer.as_ref().unwrap().estimated_size() >= self.target_file_size {
                 let sst_file = current_writer.take().unwrap().finish()?;
                 sst_file.sync_all()?;
-                let size = std::fs::metadata(self.work_dir.join(format!("{current_file_id:06}.sst")))?
-                    .len();
+                let size =
+                    std::fs::metadata(self.work_dir.join(format!("{current_file_id:06}.sst")))?
+                        .len();
                 let meta = FileMetaData {
                     file_id: current_file_id,
                     file_size: size,
@@ -228,8 +229,8 @@ impl Compactor {
         if current_writer.is_some() {
             let sst_file = current_writer.take().unwrap().finish()?;
             sst_file.sync_all()?;
-            let size = std::fs::metadata(self.work_dir.join(format!("{current_file_id:06}.sst")))?
-                .len();
+            let size =
+                std::fs::metadata(self.work_dir.join(format!("{current_file_id:06}.sst")))?.len();
             let meta = FileMetaData {
                 file_id: current_file_id,
                 file_size: size,
@@ -247,7 +248,7 @@ impl Compactor {
 mod tests {
     use super::*;
     use crate::disk::sstable::SsTable;
-    use crate::memory::core::{encode_internal_key, ValueResult};
+    use crate::memory::core::{ValueResult, encode_internal_key};
 
     struct TestIter {
         data: Vec<(Vec<u8>, Vec<u8>)>,

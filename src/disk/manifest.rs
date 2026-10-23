@@ -1,7 +1,4 @@
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::unnecessary_wraps
-)]
+#![allow(clippy::cast_possible_truncation, clippy::unnecessary_wraps)]
 
 use crate::memory::core::cmp_internal_key;
 use std::collections::HashSet;
@@ -20,7 +17,7 @@ pub struct FileMetaData {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct VersionEdit {
-    pub deleted_files: Vec<(usize, u64)>, // (level, file_id)
+    pub deleted_files: Vec<(usize, u64)>,      // (level, file_id)
     pub new_files: Vec<(usize, FileMetaData)>, // (level, meta)
 }
 
@@ -225,9 +222,8 @@ impl VersionSet {
                             }
                             return Err(e);
                         }
-                        let edit = VersionEdit::decode(&edit_buf).map_err(|e| {
-                            std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-                        })?;
+                        let edit = VersionEdit::decode(&edit_buf)
+                            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
                         for &(_, file_id) in &edit.deleted_files {
                             max_file_id = max_file_id.max(file_id);
