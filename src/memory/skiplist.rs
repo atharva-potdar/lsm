@@ -7,6 +7,7 @@ struct SkipListNode {
     key: Vec<u8>,
     value: Vec<u8>,
     next: [crossbeam_epoch::Atomic<Self>; 32],
+    #[allow(dead_code)]
     height: usize,
 }
 

@@ -18,7 +18,7 @@ impl WalWriter {
         Ok(Self { file })
     }
 
-    pub fn append(&mut self, internal_key: &[u8], value: &[u8]) -> std::io::Result<()> {
+    pub fn append(&mut self, internal_key: &[u8], value: &[u8]) -> std::io::Result<usize> {
         let key_len = internal_key.len() as u32;
         self.file.write_all(&key_len.to_le_bytes())?;
         self.file.write_all(internal_key)?;
@@ -28,7 +28,7 @@ impl WalWriter {
         self.file.write_all(value)?;
 
         self.file.flush()?;
-        Ok(())
+        Ok(4 + internal_key.len() + 4 + value.len())
     }
 }
 

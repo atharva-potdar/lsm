@@ -11,6 +11,7 @@ use crate::disk::sstable::{SSTableWriter, SsTable};
 use crate::disk::wal::{WalReader, WalWriter};
 use crate::memory::core::{ValueResult, encode_internal_key};
 use crate::memory::memtable::MemTable;
+use crate::metrics::EngineMetrics;
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::PathBuf;
@@ -41,6 +42,7 @@ pub struct DB {
     pub memtable_capacity: usize,
     pub compaction_sender: Sender<CompactionSignal>,
     pub compaction_handle: Mutex<Option<JoinHandle<()>>>,
+    pub metrics: Arc<EngineMetrics>,
 }
 
 impl DB {
@@ -91,6 +93,7 @@ impl DB {
         };
 
         let (compaction_sender, compaction_receiver) = mpsc::channel();
+        let metrics = Arc::new(EngineMetrics::new());
 
         let db = Arc::new(Self {
             work_dir,
@@ -102,6 +105,7 @@ impl DB {
             memtable_capacity,
             compaction_sender,
             compaction_handle: Mutex::new(None),
+            metrics,
         });
 
         let weak_db = Arc::downgrade(&db);
@@ -130,11 +134,22 @@ impl DB {
         Ok(db)
     }
 
+    #[must_use]
+    pub fn metrics(&self) -> Arc<EngineMetrics> {
+        Arc::clone(&self.metrics)
+    }
+
     pub fn put(&self, key: &[u8], value: &[u8]) -> std::io::Result<()> {
         let lsn = self.next_lsn.fetch_add(1, Ordering::SeqCst);
         let internal_key = encode_internal_key(key, lsn, 1);
 
-        self.wal.lock().unwrap().append(&internal_key, value)?;
+        self.metrics
+            .bytes_written_user
+            .fetch_add((key.len() + value.len()) as u64, Ordering::Relaxed);
+        let wal_bytes = self.wal.lock().unwrap().append(&internal_key, value)?;
+        self.metrics
+            .bytes_written_wal
+            .fetch_add(wal_bytes as u64, Ordering::Relaxed);
 
         let needs_flush = {
             let memtable = self.memtable.read().unwrap();
@@ -153,7 +168,13 @@ impl DB {
         let lsn = self.next_lsn.fetch_add(1, Ordering::SeqCst);
         let internal_key = encode_internal_key(key, lsn, 0);
 
-        self.wal.lock().unwrap().append(&internal_key, b"")?;
+        self.metrics
+            .bytes_written_user
+            .fetch_add(key.len() as u64, Ordering::Relaxed);
+        let wal_bytes = self.wal.lock().unwrap().append(&internal_key, b"")?;
+        self.metrics
+            .bytes_written_wal
+            .fetch_add(wal_bytes as u64, Ordering::Relaxed);
 
         let needs_flush = {
             let memtable = self.memtable.read().unwrap();
@@ -302,6 +323,9 @@ impl DB {
             let sst_file = writer.finish()?;
             sst_file.sync_all()?;
             let file_size = std::fs::metadata(&sst_path)?.len();
+            self.metrics
+                .bytes_written_flush
+                .fetch_add(file_size, Ordering::Relaxed);
             let meta = FileMetaData {
                 file_id,
                 file_size,
@@ -370,6 +394,7 @@ impl DB {
             work_dir: self.work_dir.clone(),
             block_size: 4096,
             bloom_bits_per_key: 10,
+            metrics: Some(Arc::clone(&self.metrics)),
         };
 
         loop {
@@ -818,4 +843,28 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
+
+    #[test]
+    fn test_db_metrics_tracking() {
+        let temp_dir = std::env::temp_dir().join("lsm_test_db_metrics_tracking");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        let db = DB::open(&temp_dir, 1024 * 1024).unwrap();
+        let m = db.metrics();
+        assert_eq!(m.user_bytes(), 0);
+        assert_eq!(m.total_disk_bytes(), 0);
+
+        db.put(b"hello", b"world").unwrap();
+        // 5 + 5 = 10 user bytes
+        assert_eq!(m.user_bytes(), 10);
+        // WAL record: 4 + (5 + 9) + 4 + 5 = 27 bytes
+        assert!(m.bytes_written_wal.load(Ordering::Relaxed) > 10);
+
+        db.force_flush().unwrap();
+        assert!(m.bytes_written_flush.load(Ordering::Relaxed) > 0);
+        assert!(m.write_amplification() > 1.0);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
 }
+

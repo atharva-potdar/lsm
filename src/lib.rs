@@ -1,3 +1,4 @@
 pub mod db;
-mod disk;
-mod memory;
+pub mod disk;
+pub mod memory;
+pub mod metrics;

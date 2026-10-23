@@ -117,11 +117,15 @@ impl CompactionPicker {
     }
 }
 
+use crate::metrics::EngineMetrics;
+use std::sync::Arc;
+
 pub struct Compactor {
     pub target_file_size: usize,
     pub work_dir: PathBuf,
     pub block_size: usize,
     pub bloom_bits_per_key: usize,
+    pub metrics: Option<Arc<EngineMetrics>>,
 }
 
 impl Compactor {
@@ -214,6 +218,10 @@ impl Compactor {
                 let size =
                     std::fs::metadata(self.work_dir.join(format!("{current_file_id:06}.sst")))?
                         .len();
+                if let Some(ref m) = self.metrics {
+                    m.bytes_written_compaction
+                        .fetch_add(size, std::sync::atomic::Ordering::Relaxed);
+                }
                 let meta = FileMetaData {
                     file_id: current_file_id,
                     file_size: size,
@@ -231,6 +239,10 @@ impl Compactor {
             sst_file.sync_all()?;
             let size =
                 std::fs::metadata(self.work_dir.join(format!("{current_file_id:06}.sst")))?.len();
+            if let Some(ref m) = self.metrics {
+                m.bytes_written_compaction
+                    .fetch_add(size, std::sync::atomic::Ordering::Relaxed);
+            }
             let meta = FileMetaData {
                 file_id: current_file_id,
                 file_size: size,
@@ -287,6 +299,7 @@ mod tests {
             work_dir: temp_dir.clone(),
             block_size: 1024,
             bloom_bits_per_key: 10,
+            metrics: None,
         };
 
         // Two versions of "key1": LSN 10 (newest) and LSN 5 (older)
@@ -346,6 +359,7 @@ mod tests {
             work_dir: temp_dir.clone(),
             block_size: 1024,
             bloom_bits_per_key: 10,
+            metrics: None,
         };
 
         // "key1" has tombstone at LSN 20, older version at LSN 5
