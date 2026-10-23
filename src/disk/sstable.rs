@@ -8,7 +8,7 @@ use crate::disk::block::{Block, BlockBuilder, BlockIterator};
 use crate::disk::bloom::BloomFilter;
 use xxhash_rust::xxh3::xxh3_64;
 
-use crate::memory::core::encode_internal_key;
+use crate::memory::core::{encode_internal_key, ValueResult};
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 
@@ -206,17 +206,17 @@ impl SsTable {
         })
     }
 
-    pub fn get(&self, user_key: &[u8], read_lsn: u64) -> std::io::Result<Option<Vec<u8>>> {
+    pub fn get(&self, user_key: &[u8], read_lsn: u64) -> std::io::Result<ValueResult> {
         let hash = xxh3_64(user_key);
         if !self.filter.may_contain(hash) {
-            return Ok(None);
+            return Ok(ValueResult::NotFound);
         }
 
-        let probe = encode_internal_key(user_key, read_lsn, 1);
+        let probe = encode_internal_key(user_key, read_lsn, 0);
         let mut iterator = BlockIterator::new(&self.index_block);
         iterator.seek(probe.as_slice());
         if !iterator.is_valid() {
-            return Ok(None);
+            return Ok(ValueResult::NotFound);
         }
         let handle = BlockHandle::decode(iterator.value().unwrap()[0..16].try_into().unwrap());
         let mut buf = vec![0u8; handle.size as usize];
@@ -226,21 +226,21 @@ impl SsTable {
         let mut iterator = BlockIterator::new(&block);
         iterator.seek(probe.as_slice());
         if !iterator.is_valid() {
-            return Ok(None);
+            return Ok(ValueResult::NotFound);
         }
         let internal_key = iterator.key().unwrap();
         if internal_key.len() < 9 {
-            return Ok(None);
+            return Ok(ValueResult::NotFound);
         }
         let key = &internal_key[..internal_key.len() - 9];
         if key != user_key {
-            return Ok(None);
+            return Ok(ValueResult::NotFound);
         }
         let op_type = *internal_key.last().unwrap();
         if op_type == 1 {
-            Ok(Some(iterator.value().unwrap().to_vec()))
+            Ok(ValueResult::Found(iterator.value().unwrap().to_vec()))
         } else {
-            Ok(None)
+            Ok(ValueResult::Deleted)
         }
     }
 }
@@ -290,9 +290,9 @@ mod tests {
         writer.finish().unwrap();
 
         let table = SsTable::open(&path).unwrap();
-        assert_eq!(table.get(b"apple", 110).unwrap(), Some(b"red".to_vec()));
-        assert_eq!(table.get(b"banana", 100).unwrap(), Some(b"yellow".to_vec()));
-        assert_eq!(table.get(b"banana", 110).unwrap(), None);
-        assert_eq!(table.get(b"ghost", 110).unwrap(), None);
+        assert_eq!(table.get(b"apple", 110).unwrap(), ValueResult::Found(b"red".to_vec()));
+        assert_eq!(table.get(b"banana", 100).unwrap(), ValueResult::Found(b"yellow".to_vec()));
+        assert_eq!(table.get(b"banana", 110).unwrap(), ValueResult::Deleted);
+        assert_eq!(table.get(b"ghost", 110).unwrap(), ValueResult::NotFound);
     }
 }

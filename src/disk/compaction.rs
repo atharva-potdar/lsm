@@ -113,7 +113,7 @@ impl Compactor {
 mod tests {
     use super::*;
     use crate::disk::sstable::SsTable;
-    use crate::memory::core::encode_internal_key;
+    use crate::memory::core::{encode_internal_key, ValueResult};
 
     struct TestIter {
         data: Vec<(Vec<u8>, Vec<u8>)>,
@@ -187,14 +187,14 @@ mod tests {
         // "key1" should return "val1_v2"
         assert_eq!(
             sstable.get(b"key1", 10).unwrap(),
-            Some(b"val1_v2".to_vec())
+            ValueResult::Found(b"val1_v2".to_vec())
         );
         // "key2" should be completely gone
-        assert_eq!(sstable.get(b"key2", 20).unwrap(), None);
+        assert_eq!(sstable.get(b"key2", 20).unwrap(), ValueResult::NotFound);
         // "key3" should be present
         assert_eq!(
             sstable.get(b"key3", 15).unwrap(),
-            Some(b"val3".to_vec())
+            ValueResult::Found(b"val3".to_vec())
         );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
@@ -231,8 +231,8 @@ mod tests {
         let sst_path = temp_dir.join(format!("{:06}.sst", edit.new_files[0].1.file_id));
         let sstable = SsTable::open(&sst_path).unwrap();
 
-        // Reading at read_lsn 20 encounters the tombstone and returns None (not older value)
-        assert_eq!(sstable.get(b"key1", 20).unwrap(), None);
+        // Reading at read_lsn 20 encounters the tombstone and returns ValueResult::Deleted (not older value)
+        assert_eq!(sstable.get(b"key1", 20).unwrap(), ValueResult::Deleted);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

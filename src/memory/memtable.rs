@@ -1,4 +1,4 @@
-use crate::memory::core::encode_internal_key;
+use crate::memory::core::{encode_internal_key, ValueResult};
 use crate::memory::skiplist;
 use crossbeam_epoch::Guard;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -25,19 +25,22 @@ impl MemTable {
         self.skip_list.put(internal_key, value.to_vec(), &guard);
     }
 
-    pub fn get<'g>(&'g self, user_key: &[u8], guard: &'g Guard) -> Option<&'g [u8]> {
-        let (found_key, found_value) = self.skip_list.seek(user_key, guard)?;
+    pub fn get<'g>(&'g self, user_key: &[u8], guard: &'g Guard) -> ValueResult {
+        let probe = encode_internal_key(user_key, u64::MAX, 0);
+        let Some((found_key, found_value)) = self.skip_list.seek(&probe, guard) else {
+            return ValueResult::NotFound;
+        };
 
         if found_key.len() < 9 || user_key != &found_key[..found_key.len() - 9] {
-            return None;
+            return ValueResult::NotFound;
         }
 
         let op_type = *found_key.last().unwrap();
 
         if op_type == 1 {
-            Some(found_value)
+            ValueResult::Found(found_value.to_vec())
         } else {
-            None
+            ValueResult::Deleted
         }
     }
 
@@ -72,17 +75,17 @@ mod tests {
         let guard = pin();
 
         memtable.put(b"apple", b"red", 1);
-        assert_eq!(memtable.get(b"apple", &guard), Some(b"red".as_slice()));
+        assert_eq!(memtable.get(b"apple", &guard), ValueResult::Found(b"red".to_vec()));
 
         memtable.put(b"apple", b"green", 2);
-        assert_eq!(memtable.get(b"apple", &guard), Some(b"green".as_slice()));
+        assert_eq!(memtable.get(b"apple", &guard), ValueResult::Found(b"green".to_vec()));
 
         memtable.put(b"banana", b"yellow", 3);
-        assert_eq!(memtable.get(b"banana", &guard), Some(b"yellow".as_slice()));
+        assert_eq!(memtable.get(b"banana", &guard), ValueResult::Found(b"yellow".to_vec()));
 
         memtable.delete(b"apple", 4);
-        assert_eq!(memtable.get(b"apple", &guard), None);
-        assert_eq!(memtable.get(b"banana", &guard), Some(b"yellow".as_slice()));
+        assert_eq!(memtable.get(b"apple", &guard), ValueResult::Deleted);
+        assert_eq!(memtable.get(b"banana", &guard), ValueResult::Found(b"yellow".to_vec()));
         assert_eq!(memtable.approximate_size(), 35);
     }
 }

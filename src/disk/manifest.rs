@@ -1,3 +1,4 @@
+use crate::memory::core::cmp_internal_key;
 #[allow(unused_imports)]
 use std::collections::HashSet;
 
@@ -62,7 +63,7 @@ impl Version {
         }
 
         for level_files in next_files.iter_mut().skip(1) {
-            level_files.sort_by(|a, b| a.min_key.cmp(&b.min_key));
+            level_files.sort_by(|a, b| cmp_internal_key(&a.min_key, &b.min_key));
         }
 
         Self { files: next_files }

@@ -4,6 +4,7 @@
     clippy::cast_precision_loss
 )]
 
+use crate::memory::core::cmp_internal_key;
 use std::cmp::Ordering;
 
 pub struct BlockBuilder {
@@ -212,7 +213,7 @@ impl<'a> BlockIterator<'a> {
 
             self.decode_entry_at(entry_offset);
 
-            match self.key.as_slice().cmp(target) {
+            match cmp_internal_key(self.key.as_slice(), target) {
                 Ordering::Equal => {
                     return;
                 }
@@ -230,7 +231,7 @@ impl<'a> BlockIterator<'a> {
         let entry_offset = u32::from_le_bytes(bytes.try_into().unwrap()) as usize;
         self.decode_entry_at(entry_offset);
 
-        while self.is_valid() && self.key.as_slice() < target {
+        while self.is_valid() && cmp_internal_key(self.key.as_slice(), target).is_lt() {
             self.next();
         }
     }

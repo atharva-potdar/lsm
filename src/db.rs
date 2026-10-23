@@ -7,7 +7,7 @@
 use crate::disk::manifest::{FileMetaData, VersionEdit, VersionSet};
 use crate::disk::sstable::{SSTableWriter, SsTable};
 use crate::disk::wal::{WalReader, WalWriter};
-use crate::memory::core::encode_internal_key;
+use crate::memory::core::{encode_internal_key, ValueResult};
 use crate::memory::memtable::MemTable;
 use std::collections::HashMap;
 use std::fs::File;
@@ -124,16 +124,20 @@ impl DB {
         let guard = crossbeam_epoch::pin();
         {
             let memtable = self.memtable.read().unwrap();
-            if let Some(val) = memtable.get(key, &guard) {
-                return Ok(Some(val.to_vec()));
+            match memtable.get(key, &guard) {
+                ValueResult::Found(val) => return Ok(Some(val)),
+                ValueResult::Deleted => return Ok(None),
+                ValueResult::NotFound => {}
             }
         }
 
         let mut state = self.state.lock().unwrap();
 
         for immutable in state.immutables.iter().rev() {
-            if let Some(val) = immutable.get(key, &guard) {
-                return Ok(Some(val.to_vec()));
+            match immutable.get(key, &guard) {
+                ValueResult::Found(val) => return Ok(Some(val)),
+                ValueResult::Deleted => return Ok(None),
+                ValueResult::NotFound => {}
             }
         }
 
@@ -149,8 +153,10 @@ impl DB {
                 table
             };
 
-            if let Some(val) = table.get(key, read_lsn)? {
-                return Ok(Some(val));
+            match table.get(key, read_lsn)? {
+                ValueResult::Found(val) => return Ok(Some(val)),
+                ValueResult::Deleted => return Ok(None),
+                ValueResult::NotFound => {}
             }
         }
 
@@ -189,8 +195,10 @@ impl DB {
                         table
                     };
 
-                    if let Some(val) = table.get(key, read_lsn)? {
-                        return Ok(Some(val));
+                    match table.get(key, read_lsn)? {
+                        ValueResult::Found(val) => return Ok(Some(val)),
+                        ValueResult::Deleted => return Ok(None),
+                        ValueResult::NotFound => {}
                     }
                 }
             }
@@ -209,13 +217,6 @@ impl DB {
         {
             let mut state = self.state.lock().unwrap();
             state.immutables.push(Arc::clone(&old_memtable));
-        }
-
-        let wal_path = self.work_dir.join("wal.log");
-        {
-            let mut wal = self.wal.lock().unwrap();
-            let _ = std::fs::remove_file(&wal_path);
-            *wal = WalWriter::new(&wal_path)?;
         }
 
         let file_id = {
@@ -242,7 +243,8 @@ impl DB {
         }
 
         if count > 0 {
-            writer.finish()?;
+            let sst_file = writer.finish()?;
+            sst_file.sync_all()?;
             let file_size = std::fs::metadata(&sst_path)?.len();
             let meta = FileMetaData {
                 file_id,
@@ -260,6 +262,14 @@ impl DB {
             let _ = std::fs::remove_file(&sst_path);
             let mut state = self.state.lock().unwrap();
             state.immutables.retain(|m| !Arc::ptr_eq(m, &old_memtable));
+        }
+
+        // Only after the SSTable has been written and committed do we delete the old WAL.
+        let wal_path = self.work_dir.join("wal.log");
+        {
+            let mut wal = self.wal.lock().unwrap();
+            let _ = std::fs::remove_file(&wal_path);
+            *wal = WalWriter::new(&wal_path)?;
         }
 
         Ok(())
@@ -340,6 +350,71 @@ mod tests {
 
         assert_eq!(db.get(b"long_key_01").unwrap(), Some(b"long_val_01".to_vec()));
         assert_eq!(db.get(b"long_key_02").unwrap(), Some(b"long_val_02".to_vec()));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_db_tombstone_resurrection_bug_fix() {
+        let temp_dir = std::env::temp_dir().join("lsm_test_db_tombstone_resurrection");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        let db = DB::open(&temp_dir, 1024 * 1024).unwrap();
+
+        // 1. Insert ("apple", "v1")
+        db.put(b"apple", b"v1").unwrap();
+
+        // 2. Delete "apple"
+        db.delete(b"apple").unwrap();
+
+        // 3. Force flush
+        db.force_flush().unwrap();
+
+        // 4. Before the fix, this returned Some("v1"). After the fix, it must return None.
+        assert_eq!(db.get(b"apple").unwrap(), None);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_db_tombstone_in_memtable_shadows_disk() {
+        let temp_dir = std::env::temp_dir().join("lsm_test_db_tombstone_shadows_disk");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        let db = DB::open(&temp_dir, 1024 * 1024).unwrap();
+
+        // Put and flush to disk
+        db.put(b"apple", b"v1").unwrap();
+        db.force_flush().unwrap();
+        assert_eq!(db.get(b"apple").unwrap(), Some(b"v1".to_vec()));
+
+        // Delete in memtable without flush
+        db.delete(b"apple").unwrap();
+
+        // Must return None (tombstone in active memtable masks L0 SSTable on disk)
+        assert_eq!(db.get(b"apple").unwrap(), None);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_db_prefix_lsn_ordering() {
+        let temp_dir = std::env::temp_dir().join("lsm_test_db_prefix_lsn");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        let db = DB::open(&temp_dir, 1024 * 1024).unwrap();
+
+        // Key A is a prefix of Key B
+        db.put(&[0x01], b"prefix_val").unwrap();
+        db.put(&[0x01, 0x02], b"longer_val").unwrap();
+
+        assert_eq!(db.get(&[0x01]).unwrap(), Some(b"prefix_val".to_vec()));
+        assert_eq!(db.get(&[0x01, 0x02]).unwrap(), Some(b"longer_val".to_vec()));
+
+        db.force_flush().unwrap();
+
+        assert_eq!(db.get(&[0x01]).unwrap(), Some(b"prefix_val".to_vec()));
+        assert_eq!(db.get(&[0x01, 0x02]).unwrap(), Some(b"longer_val".to_vec()));
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

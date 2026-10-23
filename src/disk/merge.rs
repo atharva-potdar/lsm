@@ -1,3 +1,4 @@
+use crate::memory::core::cmp_internal_key;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
@@ -34,10 +35,7 @@ impl<I: StorageIterator> Ord for HeapWrapper<I> {
     fn cmp(&self, other: &Self) -> Ordering {
         // Reverse the comparison of keys to turn Rust's Max-Heap into a Min-Heap!
         // Also reverse the comparison of indices so lower index (newer data) has higher priority!
-        other
-            .iter
-            .key()
-            .cmp(self.iter.key())
+        cmp_internal_key(other.iter.key(), self.iter.key())
             .then_with(|| other.index.cmp(&self.index))
     }
 }

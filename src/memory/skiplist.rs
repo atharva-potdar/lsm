@@ -1,3 +1,4 @@
+use crate::memory::core::cmp_internal_key;
 use crossbeam_epoch::Guard;
 use rand::RngExt;
 use std::sync::atomic::Ordering;
@@ -49,7 +50,7 @@ impl SkipList {
 
                 // SAFETY: The next node must exist since it is not null.
                 let next_node = unsafe { next_shared.as_ref().expect("next is not null") };
-                if next_node.key.as_slice() < search_key {
+                if cmp_internal_key(next_node.key.as_slice(), search_key).is_lt() {
                     current_node = next_node;
                 } else {
                     break;
@@ -100,7 +101,7 @@ impl SkipList {
                 }
 
                 let next_node = unsafe { next_shared.as_ref().unwrap() };
-                if next_node.key.as_slice() < key.as_slice() {
+                if cmp_internal_key(next_node.key.as_slice(), key.as_slice()).is_lt() {
                     current_shared = next_shared;
                 } else {
                     break;
@@ -135,7 +136,7 @@ impl SkipList {
                     Err(err) => {
                         let actual_node = unsafe { err.current.as_ref().unwrap() };
 
-                        if actual_node.key.as_slice() >= my_key {
+                        if cmp_internal_key(actual_node.key.as_slice(), my_key).is_ge() {
                             next_shared = err.current;
                         } else {
                             prev_node = actual_node;
@@ -146,7 +147,7 @@ impl SkipList {
                                 }
 
                                 let next_node = unsafe { next_shared.as_ref().unwrap() };
-                                if next_node.key.as_slice() < my_key {
+                                if cmp_internal_key(next_node.key.as_slice(), my_key).is_lt() {
                                     prev_node = next_node;
                                 } else {
                                     break;
