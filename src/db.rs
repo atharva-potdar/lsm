@@ -63,10 +63,12 @@ impl DB {
         }
 
         let wal = WalWriter::new(&wal_path)?;
+        let versions = VersionSet::open(&work_dir, 7)?;
+        next_lsn = next_lsn.max(versions.last_sequence + 1);
 
         let cold_state = ColdState {
             immutables: Vec::new(),
-            versions: VersionSet::new(7), // 7 levels
+            versions,
             sstables: HashMap::new(),
         };
 
@@ -131,9 +133,12 @@ impl DB {
             }
         }
 
-        let mut state = self.state.lock().unwrap();
+        let (version, immutables) = {
+            let state = self.state.lock().unwrap();
+            (state.versions.current(), state.immutables.clone())
+        };
 
-        for immutable in state.immutables.iter().rev() {
+        for immutable in immutables.iter().rev() {
             match immutable.get(key, &guard) {
                 ValueResult::Found(val) => return Ok(Some(val)),
                 ValueResult::Deleted => return Ok(None),
@@ -142,15 +147,18 @@ impl DB {
         }
 
         // Level 0: newest files are at the end, so check in reverse
-        for meta in state.versions.current.files[0].clone().iter().rev() {
+        for meta in version.files[0].iter().rev() {
             let file_id = meta.file_id;
-            let table = if let Some(table) = state.sstables.get(&file_id) {
-                Arc::clone(table)
-            } else {
-                let path = self.work_dir.join(format!("{file_id:06}.sst"));
-                let table = Arc::new(SsTable::open(&path)?);
-                state.sstables.insert(file_id, Arc::clone(&table));
-                table
+            let table = {
+                let mut state = self.state.lock().unwrap();
+                if let Some(table) = state.sstables.get(&file_id) {
+                    Arc::clone(table)
+                } else {
+                    let path = self.work_dir.join(format!("{file_id:06}.sst"));
+                    let table = Arc::new(SsTable::open(&path)?);
+                    state.sstables.insert(file_id, Arc::clone(&table));
+                    table
+                }
             };
 
             match table.get(key, read_lsn)? {
@@ -161,8 +169,8 @@ impl DB {
         }
 
         // Levels 1 to 6
-        for level in 1..state.versions.current.files.len() {
-            let files = &state.versions.current.files[level];
+        for level in 1..version.files.len() {
+            let files = &version.files[level];
             if files.is_empty() {
                 continue;
             }
@@ -186,13 +194,16 @@ impl DB {
 
                 if min_u <= key {
                     let file_id = meta.file_id;
-                    let table = if let Some(table) = state.sstables.get(&file_id) {
-                        Arc::clone(table)
-                    } else {
-                        let path = self.work_dir.join(format!("{file_id:06}.sst"));
-                        let table = Arc::new(SsTable::open(&path)?);
-                        state.sstables.insert(file_id, Arc::clone(&table));
-                        table
+                    let table = {
+                        let mut state = self.state.lock().unwrap();
+                        if let Some(table) = state.sstables.get(&file_id) {
+                            Arc::clone(table)
+                        } else {
+                            let path = self.work_dir.join(format!("{file_id:06}.sst"));
+                            let table = Arc::new(SsTable::open(&path)?);
+                            state.sstables.insert(file_id, Arc::clone(&table));
+                            table
+                        }
                     };
 
                     match table.get(key, read_lsn)? {
@@ -256,7 +267,7 @@ impl DB {
             edit.add_file(0, meta);
 
             let mut state = self.state.lock().unwrap();
-            state.versions.log_and_apply(&edit);
+            state.versions.log_and_apply(&edit)?;
             state.immutables.retain(|m| !Arc::ptr_eq(m, &old_memtable));
         } else {
             let _ = std::fs::remove_file(&sst_path);
@@ -273,6 +284,36 @@ impl DB {
         }
 
         Ok(())
+    }
+
+    pub fn current_version(&self) -> Arc<crate::disk::manifest::Version> {
+        let state = self.state.lock().unwrap();
+        state.versions.current()
+    }
+
+    pub fn apply_version_edit(&self, edit: &VersionEdit) -> std::io::Result<()> {
+        let mut state = self.state.lock().unwrap();
+        state.versions.log_and_apply(edit)?;
+        let removed = state.versions.clean_obsolete_files()?;
+        for file_id in removed {
+            state.sstables.remove(&file_id);
+        }
+        Ok(())
+    }
+
+    pub fn clean_obsolete_files(&self) -> std::io::Result<Vec<u64>> {
+        let mut state = self.state.lock().unwrap();
+        let removed = state.versions.clean_obsolete_files()?;
+        for file_id in &removed {
+            state.sstables.remove(file_id);
+        }
+        Ok(removed)
+    }
+}
+
+impl Drop for DB {
+    fn drop(&mut self) {
+        let _ = self.clean_obsolete_files();
     }
 }
 
@@ -418,4 +459,152 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
+
+    #[test]
+    fn test_manifest_lifecycle_and_garbage_collection() {
+        let temp_dir = std::env::temp_dir().join("lsm_test_manifest_lifecycle_gc");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        // 1. Start DB
+        let db = DB::open(&temp_dir, 1024 * 1024).unwrap();
+
+        // 2. Flush File 1 (L0)
+        db.put(b"key1", b"val1").unwrap();
+        db.force_flush().unwrap();
+        let file1_path = temp_dir.join("000001.sst");
+        assert!(file1_path.exists());
+
+        // 3. Flush File 2 (L0)
+        db.put(b"key2", b"val2").unwrap();
+        db.force_flush().unwrap();
+        let file2_path = temp_dir.join("000002.sst");
+        assert!(file2_path.exists());
+
+        // 4. Simulate a compaction:
+        // Create 000003.sst on disk manually containing merged data
+        let file3_id = {
+            let mut state = db.state.lock().unwrap();
+            state.versions.new_file_id()
+        };
+        assert_eq!(file3_id, 3);
+        let file3_path = temp_dir.join(format!("{file3_id:06}.sst"));
+        {
+            let file = File::create(&file3_path).unwrap();
+            let mut writer = SSTableWriter::new(file, 4096, 16, 1, 10);
+            writer.add(&encode_internal_key(b"key1", 1, 1), b"val1").unwrap();
+            writer.add(&encode_internal_key(b"key2", 2, 1), b"val2").unwrap();
+            let f = writer.finish().unwrap();
+            f.sync_all().unwrap();
+        }
+        let file3_size = std::fs::metadata(&file3_path).unwrap().len();
+
+        let mut edit = VersionEdit::default();
+        edit.add_file(
+            1,
+            FileMetaData {
+                file_id: 3,
+                file_size: file3_size,
+                min_key: encode_internal_key(b"key1", 1, 1),
+                max_key: encode_internal_key(b"key2", 2, 1),
+            },
+        );
+        edit.delete_file(0, 1);
+        edit.delete_file(0, 2);
+
+        // Apply it
+        db.apply_version_edit(&edit).unwrap();
+
+        // 5. Drop all DB handles
+        drop(db);
+
+        // 6. Check the disk: 000001.sst and 000002.sst should be physically deleted.
+        //    000003.sst should exist.
+        assert!(!file1_path.exists(), "000001.sst should be physically deleted");
+        assert!(!file2_path.exists(), "000002.sst should be physically deleted");
+        assert!(file3_path.exists(), "000003.sst must exist");
+
+        // 7. Re-open DB. VersionSet should correctly know that Level 1 has File 3, and Level 0 is empty.
+        let db2 = DB::open(&temp_dir, 1024 * 1024).unwrap();
+        {
+            let state = db2.state.lock().unwrap();
+            assert_eq!(state.versions.current.files[0].len(), 0, "Level 0 should be empty");
+            assert_eq!(state.versions.current.files[1].len(), 1, "Level 1 should have 1 file");
+            assert_eq!(state.versions.current.files[1][0].file_id, 3);
+            assert_eq!(state.versions.next_file_id, 4, "next_file_id must be MAX(1,2,3)+1 = 4");
+        }
+
+        // Verify read path works cleanly from recovered Level 1 SSTable
+        assert_eq!(db2.get(b"key1").unwrap(), Some(b"val1".to_vec()));
+        assert_eq!(db2.get(b"key2").unwrap(), Some(b"val2".to_vec()));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_reader_reference_counting_prevents_premature_file_deletion() {
+        let temp_dir = std::env::temp_dir().join("lsm_test_reader_refcount_gc");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        let db = DB::open(&temp_dir, 1024 * 1024).unwrap();
+
+        // Flush File 1
+        db.put(b"alpha", b"1").unwrap();
+        db.force_flush().unwrap();
+        let file1_path = temp_dir.join("000001.sst");
+        assert!(file1_path.exists());
+
+        // A reader starts a query and retains an Arc<Version>
+        let reader_version = db.current_version();
+        assert_eq!(reader_version.files[0].len(), 1);
+
+        // Now simulate compaction: delete File 1, add File 2
+        let file2_id = {
+            let mut state = db.state.lock().unwrap();
+            state.versions.new_file_id()
+        };
+        let file2_path = temp_dir.join(format!("{file2_id:06}.sst"));
+        {
+            let file = File::create(&file2_path).unwrap();
+            let mut writer = SSTableWriter::new(file, 4096, 16, 1, 10);
+            writer.add(&encode_internal_key(b"alpha", 1, 1), b"1").unwrap();
+            let f = writer.finish().unwrap();
+            f.sync_all().unwrap();
+        }
+        let file2_size = std::fs::metadata(&file2_path).unwrap().len();
+
+        let mut edit = VersionEdit::default();
+        edit.add_file(
+            1,
+            FileMetaData {
+                file_id: 2,
+                file_size: file2_size,
+                min_key: encode_internal_key(b"alpha", 1, 1),
+                max_key: encode_internal_key(b"alpha", 1, 1),
+            },
+        );
+        edit.delete_file(0, 1);
+        db.apply_version_edit(&edit).unwrap();
+
+        // While reader_version is still alive, File 1 must NOT be deleted!
+        assert!(
+            file1_path.exists(),
+            "000001.sst must not be deleted while active reader holds the version"
+        );
+
+        // Reader finishes query and drops version
+        drop(reader_version);
+
+        // Trigger cleanup
+        db.clean_obsolete_files().unwrap();
+
+        // Now File 1 must be unlinked!
+        assert!(
+            !file1_path.exists(),
+            "000001.sst should now be deleted after reader finishes"
+        );
+        assert!(file2_path.exists(), "000002.sst must still exist");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
 }
+
