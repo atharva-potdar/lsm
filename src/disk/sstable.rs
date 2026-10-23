@@ -145,6 +145,10 @@ impl<W: std::io::Write> SSTableWriter<W> {
         Ok(())
     }
 
+    pub const fn estimated_size(&self) -> usize {
+        (self.offset as usize) + self.data_builder.estimated_size()
+    }
+
     pub fn finish(mut self) -> std::io::Result<W> {
         self.flush_data_block()?;
 
