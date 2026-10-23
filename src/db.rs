@@ -4,6 +4,7 @@
     clippy::significant_drop_tightening
 )]
 
+use crate::cache::BlockCache;
 use crate::disk::compaction::{CompactionJob, CompactionPicker, Compactor};
 use crate::disk::manifest::{FileMetaData, VersionEdit, VersionSet};
 use crate::disk::merge::MergeIterator;
@@ -46,6 +47,7 @@ pub struct DB {
     pub compaction_handle: Mutex<Option<JoinHandle<()>>>,
     pub metrics: Arc<EngineMetrics>,
     pub filter_policy: FilterPolicy,
+    pub block_cache: Option<Arc<dyn BlockCache>>,
 }
 
 impl DB {
@@ -54,7 +56,7 @@ impl DB {
         work_dir: impl Into<PathBuf>,
         memtable_capacity: usize,
     ) -> std::io::Result<Arc<Self>> {
-        Self::open_with_policy(work_dir, memtable_capacity, FilterPolicy::Static(10))
+        Self::open_with_options(work_dir, memtable_capacity, FilterPolicy::Static(10), None)
     }
 
     /// Opens the database with a specified `FilterPolicy`.
@@ -62,6 +64,16 @@ impl DB {
         work_dir: impl Into<PathBuf>,
         memtable_capacity: usize,
         filter_policy: FilterPolicy,
+    ) -> std::io::Result<Arc<Self>> {
+        Self::open_with_options(work_dir, memtable_capacity, filter_policy, None)
+    }
+
+    /// Opens the database with a specified `FilterPolicy` and `BlockCache`.
+    pub fn open_with_options(
+        work_dir: impl Into<PathBuf>,
+        memtable_capacity: usize,
+        filter_policy: FilterPolicy,
+        block_cache: Option<Arc<dyn BlockCache>>,
     ) -> std::io::Result<Arc<Self>> {
         let work_dir = work_dir.into();
         std::fs::create_dir_all(&work_dir)?;
@@ -119,6 +131,7 @@ impl DB {
             compaction_handle: Mutex::new(None),
             metrics,
             filter_policy,
+            block_cache,
         });
 
         let weak_db = Arc::downgrade(&db);
@@ -237,7 +250,12 @@ impl DB {
                     Arc::clone(table)
                 } else {
                     let path = self.work_dir.join(format!("{file_id:06}.sst"));
-                    let table = Arc::new(SsTable::open(&path)?);
+                    let table = Arc::new(SsTable::open_with_cache(
+                        file_id,
+                        &path,
+                        self.block_cache.clone(),
+                        Some(Arc::clone(&self.metrics)),
+                    )?);
                     state.sstables.insert(file_id, Arc::clone(&table));
                     table
                 }
@@ -282,7 +300,12 @@ impl DB {
                             Arc::clone(table)
                         } else {
                             let path = self.work_dir.join(format!("{file_id:06}.sst"));
-                            let table = Arc::new(SsTable::open(&path)?);
+                            let table = Arc::new(SsTable::open_with_cache(
+                                file_id,
+                                &path,
+                                self.block_cache.clone(),
+                                Some(Arc::clone(&self.metrics)),
+                            )?);
                             state.sstables.insert(file_id, Arc::clone(&table));
                             table
                         }
@@ -433,20 +456,35 @@ impl DB {
         if job.input_level == 0 {
             for meta in job.inputs_level.iter().rev() {
                 let path = self.work_dir.join(format!("{:06}.sst", meta.file_id));
-                let table = Arc::new(SsTable::open(&path)?);
+                let table = Arc::new(SsTable::open_with_cache(
+                    meta.file_id,
+                    &path,
+                    self.block_cache.clone(),
+                    Some(Arc::clone(&self.metrics)),
+                )?);
                 iters.push(table.iter()?);
             }
         } else {
             for meta in &job.inputs_level {
                 let path = self.work_dir.join(format!("{:06}.sst", meta.file_id));
-                let table = Arc::new(SsTable::open(&path)?);
+                let table = Arc::new(SsTable::open_with_cache(
+                    meta.file_id,
+                    &path,
+                    self.block_cache.clone(),
+                    Some(Arc::clone(&self.metrics)),
+                )?);
                 iters.push(table.iter()?);
             }
         }
 
         for meta in &job.inputs_next_level {
             let path = self.work_dir.join(format!("{:06}.sst", meta.file_id));
-            let table = Arc::new(SsTable::open(&path)?);
+            let table = Arc::new(SsTable::open_with_cache(
+                meta.file_id,
+                &path,
+                self.block_cache.clone(),
+                Some(Arc::clone(&self.metrics)),
+            )?);
             iters.push(table.iter()?);
         }
 

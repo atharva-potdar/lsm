@@ -8,6 +8,7 @@ use crate::disk::block::{Block, BlockBuilder, BlockIterator};
 use crate::disk::bloom::BloomFilter;
 use xxhash_rust::xxh3::xxh3_64;
 
+use crate::cache::{BlockCache, BlockId};
 use crate::memory::core::{ValueResult, encode_internal_key};
 use crate::metrics::EngineMetrics;
 use std::fs::File;
@@ -177,9 +178,12 @@ impl<W: std::io::Write> SSTableWriter<W> {
 }
 
 pub struct SsTable {
+    pub id: u64,
     pub(crate) file: File,
     pub(crate) index_block: Block,
     pub(crate) filter: BloomFilter,
+    pub(crate) block_cache: Option<Arc<dyn BlockCache>>,
+    pub(crate) metrics: Option<Arc<EngineMetrics>>,
 }
 
 use crate::disk::merge::StorageIterator;
@@ -189,7 +193,7 @@ pub struct SsTableIterator {
     table: Arc<SsTable>,
     block_handles: Vec<BlockHandle>,
     current_block_idx: usize,
-    current_block: Option<Block>,
+    current_block: Option<Arc<Block>>,
     offset: usize,
     next_offset: usize,
     key: Vec<u8>,
@@ -234,10 +238,9 @@ impl SsTableIterator {
             return Ok(false);
         }
         let handle = &self.block_handles[idx];
-        let mut buf = vec![0u8; handle.size as usize];
-        self.table.file.read_exact_at(&mut buf, handle.offset)?;
-        let block = Block::decode(buf)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let block = self
+            .table
+            .read_block(handle.offset, handle.size, self.table.metrics.as_deref())?;
 
         self.current_block_idx = idx;
         self.offset = 0;
@@ -301,6 +304,20 @@ impl StorageIterator for SsTableIterator {
 
 impl SsTable {
     pub fn open(path: &std::path::Path) -> std::io::Result<Self> {
+        let id = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        Self::open_with_cache(id, path, None, None)
+    }
+
+    pub fn open_with_cache(
+        id: u64,
+        path: &std::path::Path,
+        block_cache: Option<Arc<dyn BlockCache>>,
+        metrics: Option<Arc<EngineMetrics>>,
+    ) -> std::io::Result<Self> {
         let file = File::open(path)?;
         let file_len = file.metadata()?.len();
         if file_len < 40 {
@@ -319,10 +336,53 @@ impl SsTable {
         let index_block = Block::decode(i_block)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         Ok(Self {
+            id,
             file,
             index_block,
             filter,
+            block_cache,
+            metrics,
         })
+    }
+
+    pub fn read_block(
+        &self,
+        offset: u64,
+        size: u64,
+        metrics: Option<&EngineMetrics>,
+    ) -> std::io::Result<Arc<Block>> {
+        let m = metrics.or(self.metrics.as_deref());
+        let block_id = BlockId {
+            sst_id: self.id,
+            offset,
+        };
+
+        if let Some(ref cache) = self.block_cache {
+            if let Some(block) = cache.get(&block_id) {
+                if let Some(m) = m {
+                    m.cache_hits.fetch_add(1, Ordering::Relaxed);
+                }
+                return Ok(block);
+            }
+            if let Some(m) = m {
+                m.cache_misses.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let mut buf = vec![0u8; size as usize];
+        self.file.read_exact_at(&mut buf, offset)?;
+        if let Some(m) = m {
+            m.bytes_read_disk.fetch_add(size, Ordering::Relaxed);
+        }
+        let block = Arc::new(
+            Block::decode(buf).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
+        );
+
+        if let Some(ref cache) = self.block_cache {
+            cache.insert(block_id, Arc::clone(&block));
+        }
+
+        Ok(block)
     }
 
     pub fn iter(self: &Arc<Self>) -> std::io::Result<SsTableIterator> {
@@ -351,13 +411,7 @@ impl SsTable {
             return Ok(ValueResult::NotFound);
         }
         let handle = BlockHandle::decode(iterator.value().unwrap()[0..16].try_into().unwrap());
-        let mut buf = vec![0u8; handle.size as usize];
-        self.file.read_exact_at(&mut buf, handle.offset)?;
-        if let Some(m) = metrics {
-            m.bytes_read_disk.fetch_add(handle.size, Ordering::Relaxed);
-        }
-        let block = Block::decode(buf)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let block = self.read_block(handle.offset, handle.size, metrics)?;
         let mut iterator = BlockIterator::new(&block);
         iterator.seek(probe.as_slice());
         if !iterator.is_valid() {

@@ -7,6 +7,8 @@ pub struct EngineMetrics {
     pub bytes_written_flush: AtomicU64,
     pub bytes_written_compaction: AtomicU64,
     pub bytes_read_disk: AtomicU64,
+    pub cache_hits: AtomicU64,
+    pub cache_misses: AtomicU64,
 }
 
 impl EngineMetrics {
@@ -33,6 +35,18 @@ impl EngineMetrics {
     }
 
     #[must_use]
+    pub fn cache_hit_ratio(&self) -> f64 {
+        let hits = self.cache_hits.load(Ordering::Relaxed) as f64;
+        let misses = self.cache_misses.load(Ordering::Relaxed) as f64;
+        let total = hits + misses;
+        if total == 0.0 {
+            0.0
+        } else {
+            hits / total
+        }
+    }
+
+    #[must_use]
     pub fn write_amplification(&self) -> f64 {
         let user = self.user_bytes() as f64;
         if user == 0.0 {
@@ -48,6 +62,8 @@ impl EngineMetrics {
         self.bytes_written_flush.store(0, Ordering::Relaxed);
         self.bytes_written_compaction.store(0, Ordering::Relaxed);
         self.bytes_read_disk.store(0, Ordering::Relaxed);
+        self.cache_hits.store(0, Ordering::Relaxed);
+        self.cache_misses.store(0, Ordering::Relaxed);
     }
 }
 

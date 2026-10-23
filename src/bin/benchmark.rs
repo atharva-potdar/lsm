@@ -1,7 +1,9 @@
 use clap::Parser;
+use lsm::cache::{BlockCache, LruBlockCache, SieveBlockCache};
 use lsm::db::{DB, FilterPolicy};
 use rand::RngExt;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
 #[derive(Parser, Debug)]
@@ -37,6 +39,22 @@ struct Args {
     /// Filter policy: "static" (10 bits/key) or "monkey" (L0=20, L1=15, L2=10, L3+=5)
     #[arg(short = 'p', long, default_value = "static")]
     filter_policy: String,
+
+    /// Cache type: "none", "lru", or "sieve"
+    #[arg(short = 'c', long, default_value = "none")]
+    cache_type: String,
+
+    /// Cache capacity in number of 4KB blocks
+    #[arg(long, default_value_t = 1000)]
+    cache_capacity: usize,
+
+    /// Number of mixed compaction churn operations to execute
+    #[arg(long, default_value_t = 0)]
+    churn_ops: usize,
+
+    /// Ratio of reads during churn benchmark (e.g. 0.8 = 80% reads / 20% writes)
+    #[arg(long, default_value_t = 0.8)]
+    read_ratio: f64,
 }
 
 /// Classic YCSB / Gray Zipfian distribution generator.
@@ -114,6 +132,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "Static (10 bits/key)"
         }
     );
+    println!(
+        "  Block Cache:         {:>12} (capacity: {} blocks)",
+        args.cache_type.to_uppercase(),
+        args.cache_capacity
+    );
     println!("  MemTable Capacity:   {:>12.2} MB", args.memtable_capacity as f64 / 1_048_576.0);
     println!("  Working Directory:   {:>12?}", args.work_dir);
     println!("--------------------------------------------------------------------------------");
@@ -127,7 +150,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => FilterPolicy::Static(10),
     };
 
-    let db = DB::open_with_policy(&args.work_dir, args.memtable_capacity, policy)?;
+    let block_cache: Option<Arc<dyn BlockCache>> = match args.cache_type.to_lowercase().as_str() {
+        "sieve" => Some(Arc::new(SieveBlockCache::new(args.cache_capacity))),
+        "lru" => Some(Arc::new(LruBlockCache::new(args.cache_capacity))),
+        _ => None,
+    };
+
+    let db = DB::open_with_options(
+        &args.work_dir,
+        args.memtable_capacity,
+        policy,
+        block_cache,
+    )?;
     let metrics = db.metrics();
 
     let zipf = if args.skew > 0.0 {
@@ -249,6 +283,85 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  Read Throughput:          {:>12.0} ops/sec", read_ops_sec);
         println!("  Disk Bytes Read:          {:>12.2} MB  ({} bytes)", mb_read, format_number(bytes_read as usize));
         println!("  Avg Disk Read per Query:  {:>12.2} bytes/op", avg_bytes);
+        println!("================================================================================");
+    }
+
+    if args.churn_ops > 0 {
+        println!("\n================================================================================");
+        println!("               PHASE 3: COMPACTION CHURN & CACHE RETENTION BENCHMARK             ");
+        println!("================================================================================");
+        println!(
+            "Workload: {} mixed operations ({}% reads / {}% writes) with {} cache ({} blocks)",
+            format_number(args.churn_ops),
+            (args.read_ratio * 100.0) as usize,
+            ((1.0 - args.read_ratio) * 100.0) as usize,
+            args.cache_type.to_uppercase(),
+            args.cache_capacity
+        );
+
+        metrics.cache_hits.store(0, std::sync::atomic::Ordering::Relaxed);
+        metrics.cache_misses.store(0, std::sync::atomic::Ordering::Relaxed);
+
+        let churn_start = Instant::now();
+        let churn_interval = (args.churn_ops / 10).max(1);
+
+        for i in 1..=args.churn_ops {
+            let is_read = rng.random_range(0.0..1.0) < args.read_ratio;
+            let key_idx = if let Some(ref z) = zipf {
+                z.next(&mut rng)
+            } else {
+                rng.random_range(0..args.num_keys as u64)
+            };
+            let key = format!("user_{:010}", key_idx * 2);
+
+            if is_read {
+                let _ = db.get(key.as_bytes())?;
+            } else {
+                db.put(key.as_bytes(), &value)?;
+            }
+
+            if i % churn_interval == 0 || i == args.churn_ops {
+                let pct = (i as f64 / args.churn_ops as f64) * 100.0;
+                let elapsed = churn_start.elapsed().as_secs_f64();
+                let ops_sec = i as f64 / elapsed;
+                let hits = metrics.cache_hits.load(std::sync::atomic::Ordering::Relaxed);
+                let misses = metrics.cache_misses.load(std::sync::atomic::Ordering::Relaxed);
+                let ratio = if hits + misses > 0 {
+                    hits as f64 / (hits + misses) as f64
+                } else {
+                    0.0
+                };
+                print!(
+                    "\rChurn Progress: [{:>6.1}%]  {:>10}/{:<10}  ({:>8.0} ops/sec, hit ratio: {:.2}%)",
+                    pct, i, args.churn_ops, ops_sec, ratio * 100.0
+                );
+                std::io::Write::flush(&mut std::io::stdout())?;
+            }
+        }
+        println!();
+
+        // Settle remaining writes and wait for compactions
+        db.force_flush()?;
+        db.wait_for_compaction();
+
+        let churn_elapsed = churn_start.elapsed().as_secs_f64();
+        let hits = metrics.cache_hits.load(std::sync::atomic::Ordering::Relaxed);
+        let misses = metrics.cache_misses.load(std::sync::atomic::Ordering::Relaxed);
+        let total_cache_lookups = hits + misses;
+        let hit_ratio = if total_cache_lookups > 0 {
+            (hits as f64 / total_cache_lookups as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        println!("--------------------------------------------------------------------------------");
+        println!("Compaction Churn Results (Cache: {}):", args.cache_type.to_uppercase());
+        println!("  Total Mixed Operations:   {:>12}", format_number(args.churn_ops));
+        println!("  Elapsed Time:             {:>12.2}s", churn_elapsed);
+        println!("  Throughput:               {:>12.0} ops/sec", args.churn_ops as f64 / churn_elapsed);
+        println!("  Cache Hits:               {:>12}", format_number(hits as usize));
+        println!("  Cache Misses:             {:>12}", format_number(misses as usize));
+        println!("  Cache Hit Ratio:          {:>11.2}%", hit_ratio);
         println!("================================================================================");
     }
 
