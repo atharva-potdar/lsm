@@ -1,8 +1,121 @@
-use crate::disk::manifest::{FileMetaData, VersionEdit};
+use crate::disk::manifest::{FileMetaData, Version, VersionEdit};
 use crate::disk::merge::{MergeIterator, StorageIterator};
 use crate::disk::sstable::SSTableWriter;
 use std::fs::File;
 use std::path::PathBuf;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(clippy::struct_field_names)]
+pub struct CompactionJob {
+    pub input_level: usize,
+    pub output_level: usize,
+    pub inputs_level: Vec<FileMetaData>,
+    pub inputs_next_level: Vec<FileMetaData>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CompactionPicker {
+    pub l0_trigger: usize,
+    pub base_level_size: u64,
+    pub level_size_multiplier: u64,
+}
+
+impl Default for CompactionPicker {
+    fn default() -> Self {
+        Self {
+            l0_trigger: 4,
+            base_level_size: 10 * 1024 * 1024,
+            level_size_multiplier: 10,
+        }
+    }
+}
+
+const fn user_key(internal_key: &[u8]) -> &[u8] {
+    if internal_key.len() >= 9 {
+        let (k, _) = internal_key.split_at(internal_key.len() - 9);
+        k
+    } else {
+        internal_key
+    }
+}
+
+fn files_overlap(a: &FileMetaData, min_u: &[u8], max_u: &[u8]) -> bool {
+    let a_min = user_key(&a.min_key);
+    let a_max = user_key(&a.max_key);
+    a_min <= max_u && min_u <= a_max
+}
+
+impl CompactionPicker {
+    #[must_use]
+    pub fn pick_compaction(&self, version: &Version) -> Option<CompactionJob> {
+        let num_levels = version.files.len();
+        if num_levels < 2 {
+            return None;
+        }
+
+        // 1. Check Level 0 trigger
+        if version.files[0].len() >= self.l0_trigger {
+            let inputs_level = version.files[0].clone();
+            let mut min_u = None;
+            let mut max_u = None;
+
+            for f in &inputs_level {
+                let f_min = user_key(&f.min_key);
+                let f_max = user_key(&f.max_key);
+                if min_u.is_none() || f_min < min_u.unwrap() {
+                    min_u = Some(f_min);
+                }
+                if max_u.is_none() || f_max > max_u.unwrap() {
+                    max_u = Some(f_max);
+                }
+            }
+
+            let mut inputs_next_level = Vec::new();
+            if let (Some(min_u), Some(max_u)) = (min_u, max_u) {
+                for f in &version.files[1] {
+                    if files_overlap(f, min_u, max_u) {
+                        inputs_next_level.push(f.clone());
+                    }
+                }
+            }
+
+            return Some(CompactionJob {
+                input_level: 0,
+                output_level: 1,
+                inputs_level,
+                inputs_next_level,
+            });
+        }
+
+        // 2. Check Level i (i > 0) size triggers
+        let mut level_max_bytes = self.base_level_size;
+        for i in 1..num_levels - 1 {
+            let total_size: u64 = version.files[i].iter().map(|f| f.file_size).sum();
+            if total_size > level_max_bytes && !version.files[i].is_empty() {
+                let file_to_compact = version.files[i][0].clone();
+                let f_min = user_key(&file_to_compact.min_key);
+                let f_max = user_key(&file_to_compact.max_key);
+
+                let mut inputs_next_level = Vec::new();
+                for f in &version.files[i + 1] {
+                    if files_overlap(f, f_min, f_max) {
+                        inputs_next_level.push(f.clone());
+                    }
+                }
+
+                return Some(CompactionJob {
+                    input_level: i,
+                    output_level: i + 1,
+                    inputs_level: vec![file_to_compact],
+                    inputs_next_level,
+                });
+            }
+            level_max_bytes = level_max_bytes.saturating_mul(self.level_size_multiplier);
+        }
+
+        None
+    }
+}
 
 pub struct Compactor {
     pub target_file_size: usize,
@@ -14,10 +127,30 @@ pub struct Compactor {
 impl Compactor {
     /// Streams a `MergeIterator`, deduplicates versions, drops bottom-level tombstones, 
     /// and writes the output to new `SSTables`, returning a `VersionEdit`.
+    #[allow(dead_code)]
     pub fn compact<I: StorageIterator>(
         &self,
-        mut iter: MergeIterator<I>,
+        iter: MergeIterator<I>,
         next_file_id: &mut u64,
+        output_level: usize,
+        is_bottom_level: bool,
+    ) -> std::io::Result<VersionEdit> {
+        self.compact_with(
+            iter,
+            &mut || {
+                let id = *next_file_id;
+                *next_file_id += 1;
+                id
+            },
+            output_level,
+            is_bottom_level,
+        )
+    }
+
+    pub fn compact_with<I: StorageIterator>(
+        &self,
+        mut iter: MergeIterator<I>,
+        alloc_file_id: &mut dyn FnMut() -> u64,
         output_level: usize,
         is_bottom_level: bool,
     ) -> std::io::Result<VersionEdit> {
@@ -56,8 +189,7 @@ impl Compactor {
             }
 
             if current_writer.is_none() {
-                current_file_id = *next_file_id;
-                *next_file_id += 1;
+                current_file_id = alloc_file_id();
                 let path = self.work_dir.join(format!("{current_file_id:06}.sst"));
                 let file = File::create(path)?;
                 current_writer = Some(SSTableWriter::new(
@@ -77,7 +209,8 @@ impl Compactor {
             max_key = internal_key.to_vec();
 
             if current_writer.as_ref().unwrap().estimated_size() >= self.target_file_size {
-                current_writer.take().unwrap().finish()?;
+                let sst_file = current_writer.take().unwrap().finish()?;
+                sst_file.sync_all()?;
                 let size = std::fs::metadata(self.work_dir.join(format!("{current_file_id:06}.sst")))?
                     .len();
                 let meta = FileMetaData {
@@ -93,7 +226,8 @@ impl Compactor {
         }
 
         if current_writer.is_some() {
-            current_writer.take().unwrap().finish()?;
+            let sst_file = current_writer.take().unwrap().finish()?;
+            sst_file.sync_all()?;
             let size = std::fs::metadata(self.work_dir.join(format!("{current_file_id:06}.sst")))?
                 .len();
             let meta = FileMetaData {
@@ -235,5 +369,57 @@ mod tests {
         assert_eq!(sstable.get(b"key1", 20).unwrap(), ValueResult::Deleted);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_compaction_picker_l0_trigger() {
+        let picker = CompactionPicker {
+            l0_trigger: 4,
+            base_level_size: 10 * 1024 * 1024,
+            level_size_multiplier: 10,
+        };
+
+        let mut version = Version::new(7);
+        // Add 3 files to L0: should not trigger
+        for i in 1..=3 {
+            version.files[0].push(FileMetaData {
+                file_id: i,
+                file_size: 1024,
+                min_key: encode_internal_key(b"a", i, 1),
+                max_key: encode_internal_key(b"b", i, 1),
+            });
+        }
+        assert!(picker.pick_compaction(&version).is_none());
+
+        // Add 4th file to L0: should trigger!
+        version.files[0].push(FileMetaData {
+            file_id: 4,
+            file_size: 1024,
+            min_key: encode_internal_key(b"c", 4, 1),
+            max_key: encode_internal_key(b"d", 4, 1),
+        });
+
+        // Add overlapping and non-overlapping files to L1
+        // L1 file 10: "b".."c" (overlaps with L0 range "a".."d")
+        version.files[1].push(FileMetaData {
+            file_id: 10,
+            file_size: 2048,
+            min_key: encode_internal_key(b"b", 1, 1),
+            max_key: encode_internal_key(b"c", 1, 1),
+        });
+        // L1 file 11: "x".."z" (does NOT overlap with "a".."d")
+        version.files[1].push(FileMetaData {
+            file_id: 11,
+            file_size: 2048,
+            min_key: encode_internal_key(b"x", 1, 1),
+            max_key: encode_internal_key(b"z", 1, 1),
+        });
+
+        let job = picker.pick_compaction(&version).unwrap();
+        assert_eq!(job.input_level, 0);
+        assert_eq!(job.output_level, 1);
+        assert_eq!(job.inputs_level.len(), 4);
+        assert_eq!(job.inputs_next_level.len(), 1);
+        assert_eq!(job.inputs_next_level[0].file_id, 10);
     }
 }

@@ -4,7 +4,9 @@
     clippy::significant_drop_tightening
 )]
 
+use crate::disk::compaction::{CompactionJob, CompactionPicker, Compactor};
 use crate::disk::manifest::{FileMetaData, VersionEdit, VersionSet};
+use crate::disk::merge::MergeIterator;
 use crate::disk::sstable::{SSTableWriter, SsTable};
 use crate::disk::wal::{WalReader, WalWriter};
 use crate::memory::core::{encode_internal_key, ValueResult};
@@ -13,7 +15,15 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Sender, SyncSender};
 use std::sync::{Arc, Mutex, RwLock};
+use std::thread::JoinHandle;
+
+pub enum CompactionSignal {
+    Check,
+    Sync(SyncSender<()>),
+    Shutdown,
+}
 
 pub struct ColdState {
     pub immutables: Vec<Arc<MemTable>>,
@@ -24,10 +34,13 @@ pub struct ColdState {
 pub struct DB {
     pub work_dir: PathBuf,
     pub next_lsn: AtomicU64,
+    pub next_file_id: AtomicU64,
     pub memtable: RwLock<Arc<MemTable>>,
     pub wal: Mutex<WalWriter>,
     pub state: Mutex<ColdState>,
     pub memtable_capacity: usize,
+    pub compaction_sender: Sender<CompactionSignal>,
+    pub compaction_handle: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl DB {
@@ -66,20 +79,51 @@ impl DB {
         let versions = VersionSet::open(&work_dir, 7)?;
         next_lsn = next_lsn.max(versions.last_sequence + 1);
 
+        let next_file_id_val = versions.next_file_id;
         let cold_state = ColdState {
             immutables: Vec::new(),
             versions,
             sstables: HashMap::new(),
         };
 
-        Ok(Arc::new(Self {
+        let (compaction_sender, compaction_receiver) = mpsc::channel();
+
+        let db = Arc::new(Self {
             work_dir,
             next_lsn: AtomicU64::new(next_lsn),
+            next_file_id: AtomicU64::new(next_file_id_val),
             memtable: RwLock::new(Arc::new(memtable)),
             wal: Mutex::new(wal),
             state: Mutex::new(cold_state),
             memtable_capacity,
-        }))
+            compaction_sender,
+            compaction_handle: Mutex::new(None),
+        });
+
+        let weak_db = Arc::downgrade(&db);
+        let handle = std::thread::spawn(move || {
+            while let Ok(signal) = compaction_receiver.recv() {
+                match signal {
+                    CompactionSignal::Shutdown => break,
+                    CompactionSignal::Check => {
+                        if let Some(db) = weak_db.upgrade() {
+                            let _ = db.run_compaction_loop();
+                        } else {
+                            break;
+                        }
+                    }
+                    CompactionSignal::Sync(sender) => {
+                        if let Some(db) = weak_db.upgrade() {
+                            let _ = db.run_compaction_loop();
+                        }
+                        let _ = sender.send(());
+                    }
+                }
+            }
+        });
+
+        *db.compaction_handle.lock().unwrap() = Some(handle);
+        Ok(db)
     }
 
     pub fn put(&self, key: &[u8], value: &[u8]) -> std::io::Result<()> {
@@ -230,10 +274,7 @@ impl DB {
             state.immutables.push(Arc::clone(&old_memtable));
         }
 
-        let file_id = {
-            let mut state = self.state.lock().unwrap();
-            state.versions.new_file_id()
-        };
+        let file_id = self.next_file_id.fetch_add(1, Ordering::SeqCst);
 
         let sst_path = self.work_dir.join(format!("{file_id:06}.sst"));
         let file = File::create(&sst_path)?;
@@ -269,6 +310,9 @@ impl DB {
             let mut state = self.state.lock().unwrap();
             state.versions.log_and_apply(&edit)?;
             state.immutables.retain(|m| !Arc::ptr_eq(m, &old_memtable));
+            drop(state);
+
+            let _ = self.compaction_sender.send(CompactionSignal::Check);
         } else {
             let _ = std::fs::remove_file(&sst_path);
             let mut state = self.state.lock().unwrap();
@@ -286,12 +330,17 @@ impl DB {
         Ok(())
     }
 
+    #[must_use]
     pub fn current_version(&self) -> Arc<crate::disk::manifest::Version> {
         let state = self.state.lock().unwrap();
         state.versions.current()
     }
 
     pub fn apply_version_edit(&self, edit: &VersionEdit) -> std::io::Result<()> {
+        for (_, meta) in &edit.new_files {
+            self.next_file_id
+                .fetch_max(meta.file_id + 1, Ordering::SeqCst);
+        }
         let mut state = self.state.lock().unwrap();
         state.versions.log_and_apply(edit)?;
         let removed = state.versions.clean_obsolete_files()?;
@@ -309,10 +358,91 @@ impl DB {
         }
         Ok(removed)
     }
+
+    pub fn run_compaction_loop(&self) -> std::io::Result<()> {
+        let picker = CompactionPicker::default();
+        let compactor = Compactor {
+            target_file_size: 2 * 1024 * 1024,
+            work_dir: self.work_dir.clone(),
+            block_size: 4096,
+            bloom_bits_per_key: 10,
+        };
+
+        loop {
+            let version = self.current_version();
+            let Some(job) = picker.pick_compaction(&version) else {
+                break;
+            };
+
+            self.run_compaction_job(&compactor, &version, &job)?;
+        }
+        Ok(())
+    }
+
+    fn run_compaction_job(
+        &self,
+        compactor: &Compactor,
+        version: &crate::disk::manifest::Version,
+        job: &CompactionJob,
+    ) -> std::io::Result<()> {
+        let mut iters = Vec::new();
+        if job.input_level == 0 {
+            for meta in job.inputs_level.iter().rev() {
+                let path = self.work_dir.join(format!("{:06}.sst", meta.file_id));
+                let table = Arc::new(SsTable::open(&path)?);
+                iters.push(table.iter()?);
+            }
+        } else {
+            for meta in &job.inputs_level {
+                let path = self.work_dir.join(format!("{:06}.sst", meta.file_id));
+                let table = Arc::new(SsTable::open(&path)?);
+                iters.push(table.iter()?);
+            }
+        }
+
+        for meta in &job.inputs_next_level {
+            let path = self.work_dir.join(format!("{:06}.sst", meta.file_id));
+            let table = Arc::new(SsTable::open(&path)?);
+            iters.push(table.iter()?);
+        }
+
+        let merge_iter = MergeIterator::new(iters);
+        let num_levels = version.files.len();
+        let is_bottom_level = job.output_level >= num_levels - 1
+            || (job.output_level + 1..num_levels).all(|lvl| version.files[lvl].is_empty());
+
+        let mut edit = compactor.compact_with(
+            merge_iter,
+            &mut || self.next_file_id.fetch_add(1, Ordering::SeqCst),
+            job.output_level,
+            is_bottom_level,
+        )?;
+
+        for f in &job.inputs_level {
+            edit.delete_file(job.input_level, f.file_id);
+        }
+        for f in &job.inputs_next_level {
+            edit.delete_file(job.output_level, f.file_id);
+        }
+
+        self.apply_version_edit(&edit)?;
+        Ok(())
+    }
+
+    pub fn wait_for_compaction(&self) {
+        let (tx, rx) = std::sync::mpsc::sync_channel(0);
+        if self.compaction_sender.send(CompactionSignal::Sync(tx)).is_ok() {
+            let _ = rx.recv();
+        }
+    }
 }
 
 impl Drop for DB {
     fn drop(&mut self) {
+        let _ = self.compaction_sender.send(CompactionSignal::Shutdown);
+        if let Some(handle) = self.compaction_handle.lock().ok().and_then(|mut l| l.take()) {
+            let _ = handle.join();
+        }
         let _ = self.clean_obsolete_files();
     }
 }
@@ -603,6 +733,55 @@ mod tests {
             "000001.sst should now be deleted after reader finishes"
         );
         assert!(file2_path.exists(), "000002.sst must still exist");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_background_compaction_cascade() {
+        let temp_dir = std::env::temp_dir().join("lsm_test_compaction_cascade");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        // Small capacity (64KB) to trigger frequent automatic flushes to L0
+        let db = DB::open(&temp_dir, 64 * 1024).unwrap();
+
+        let num_keys = 100_000;
+        for i in 0..num_keys {
+            let k = format!("key_{i:06}");
+            let v = format!("val_{i:06}");
+            db.put(k.as_bytes(), v.as_bytes()).unwrap();
+        }
+
+        // Flush any remaining entries in the active memtable
+        db.force_flush().unwrap();
+
+        // Wait for background compactions to finish
+        db.wait_for_compaction();
+
+        let version = db.current_version();
+        assert!(
+            version.files[0].len() < 4,
+            "Level 0 should have fewer than 4 files, got {}",
+            version.files[0].len()
+        );
+        assert!(
+            !version.files[1].is_empty(),
+            "Level 1 should contain compacted files"
+        );
+
+        assert_eq!(
+            db.get(b"key_000000").unwrap(),
+            Some(b"val_000000".to_vec())
+        );
+        assert_eq!(
+            db.get(b"key_099999").unwrap(),
+            Some(b"val_099999".to_vec())
+        );
+        assert_eq!(
+            db.get(b"key_050000").unwrap(),
+            Some(b"val_050000".to_vec())
+        );
+        assert_eq!(db.get(b"nonexistent").unwrap(), None);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

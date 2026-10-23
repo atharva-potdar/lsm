@@ -175,9 +175,125 @@ impl<W: std::io::Write> SSTableWriter<W> {
 }
 
 pub struct SsTable {
-    file: File,
-    index_block: Block,
-    filter: BloomFilter,
+    pub(crate) file: File,
+    pub(crate) index_block: Block,
+    pub(crate) filter: BloomFilter,
+}
+
+use crate::disk::merge::StorageIterator;
+use std::sync::Arc;
+
+pub struct SsTableIterator {
+    table: Arc<SsTable>,
+    block_handles: Vec<BlockHandle>,
+    current_block_idx: usize,
+    current_block: Option<Block>,
+    offset: usize,
+    next_offset: usize,
+    key: Vec<u8>,
+    value: Vec<u8>,
+    valid: bool,
+}
+
+impl SsTableIterator {
+    pub fn new(table: Arc<SsTable>) -> std::io::Result<Self> {
+        let mut index_iter = BlockIterator::new(&table.index_block);
+        index_iter.seek_to_first();
+        let mut block_handles = Vec::new();
+        while index_iter.is_valid() {
+            let handle_bytes: [u8; 16] = index_iter.value().unwrap()[0..16].try_into().unwrap();
+            block_handles.push(BlockHandle::decode(&handle_bytes));
+            index_iter.next();
+        }
+
+        let mut iter = Self {
+            table,
+            block_handles,
+            current_block_idx: 0,
+            current_block: None,
+            offset: 0,
+            next_offset: 0,
+            key: Vec::new(),
+            value: Vec::new(),
+            valid: false,
+        };
+
+        if !iter.block_handles.is_empty() {
+            iter.load_block(0)?;
+        }
+
+        Ok(iter)
+    }
+
+    fn load_block(&mut self, idx: usize) -> std::io::Result<bool> {
+        if idx >= self.block_handles.len() {
+            self.valid = false;
+            self.current_block = None;
+            return Ok(false);
+        }
+        let handle = &self.block_handles[idx];
+        let mut buf = vec![0u8; handle.size as usize];
+        self.table.file.read_exact_at(&mut buf, handle.offset)?;
+        let block = Block::decode(buf)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+        self.current_block_idx = idx;
+        self.offset = 0;
+        self.next_offset = 0;
+
+        if let Some((next_offset, val_start, val_len)) = block.decode_entry(0, &mut self.key) {
+            self.value.clear();
+            self.value.extend_from_slice(&block.data()[val_start..val_start + val_len]);
+            self.offset = 0;
+            self.next_offset = next_offset;
+            self.valid = true;
+            self.current_block = Some(block);
+            return Ok(true);
+        }
+
+        self.current_block = Some(block);
+        self.valid = false;
+        Ok(false)
+    }
+}
+
+impl StorageIterator for SsTableIterator {
+    fn is_valid(&self) -> bool {
+        self.valid
+    }
+
+    fn key(&self) -> &[u8] {
+        &self.key
+    }
+
+    fn value(&self) -> &[u8] {
+        &self.value
+    }
+
+    #[allow(clippy::collapsible_if)]
+    fn next(&mut self) {
+        if !self.valid {
+            return;
+        }
+
+        if let Some(ref block) = self.current_block {
+            if self.next_offset < block.restart_offset() {
+                if let Some((next_offset, val_start, val_len)) =
+                    block.decode_entry(self.next_offset, &mut self.key)
+                {
+                    self.value.clear();
+                    self.value
+                        .extend_from_slice(&block.data()[val_start..val_start + val_len]);
+                    self.offset = self.next_offset;
+                    self.next_offset = next_offset;
+                    return;
+                }
+            }
+        }
+
+        let next_idx = self.current_block_idx + 1;
+        let _ = self.load_block(next_idx);
+    }
 }
 
 impl SsTable {
@@ -204,6 +320,10 @@ impl SsTable {
             index_block,
             filter,
         })
+    }
+
+    pub fn iter(self: &Arc<Self>) -> std::io::Result<SsTableIterator> {
+        SsTableIterator::new(Arc::clone(self))
     }
 
     pub fn get(&self, user_key: &[u8], read_lsn: u64) -> std::io::Result<ValueResult> {
@@ -295,4 +415,37 @@ mod tests {
         assert_eq!(table.get(b"banana", 110).unwrap(), ValueResult::Deleted);
         assert_eq!(table.get(b"ghost", 110).unwrap(), ValueResult::NotFound);
     }
+
+    #[test]
+    fn test_sstable_iterator() {
+        use std::env::temp_dir;
+        let path = temp_dir().join("test_sstable_iter.sst");
+        let file = std::fs::File::create(&path).unwrap();
+
+        // Use a small block size (64 bytes) to force creation of multiple data blocks
+        let mut writer = SSTableWriter::new(file, 64, 4, 1, 10);
+        let mut expected = Vec::new();
+
+        for i in 0..30 {
+            let key_str = format!("key_{i:04}");
+            let val_str = format!("val_{i:04}");
+            let k = encode_internal_key(key_str.as_bytes(), 100, 1);
+            writer.add(&k, val_str.as_bytes()).unwrap();
+            expected.push((k, val_str.into_bytes()));
+        }
+        writer.finish().unwrap();
+
+        let table = Arc::new(SsTable::open(&path).unwrap());
+        let mut iter = table.iter().unwrap();
+
+        let mut collected = Vec::new();
+        while iter.is_valid() {
+            collected.push((iter.key().to_vec(), iter.value().to_vec()));
+            iter.next();
+        }
+
+        assert_eq!(collected, expected);
+        let _ = std::fs::remove_file(&path);
+    }
 }
+

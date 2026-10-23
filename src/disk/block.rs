@@ -95,7 +95,7 @@ pub struct Block {
 }
 
 impl Block {
-    const fn decode_varint(data: &[u8], mut offset: usize) -> (u32, usize) {
+    pub const fn decode_varint(data: &[u8], mut offset: usize) -> (u32, usize) {
         let mut result: u32 = 0;
         let mut shift = 0;
 
@@ -117,6 +117,41 @@ impl Block {
         }
 
         (result, offset)
+    }
+
+    pub fn decode_entry(
+        &self,
+        offset: usize,
+        key: &mut Vec<u8>,
+    ) -> Option<(usize, usize, usize)> {
+        if offset >= self.restart_offset {
+            return None;
+        }
+        let (shared_len, offset1) = Self::decode_varint(&self.data, offset);
+        let (unshared_len, offset2) = Self::decode_varint(&self.data, offset1);
+        let (value_len, offset3) = Self::decode_varint(&self.data, offset2);
+        let unshared_key = &self.data[offset3..offset3 + unshared_len as usize];
+        key.truncate(shared_len as usize);
+        key.extend_from_slice(unshared_key);
+        let val_start = offset3 + unshared_len as usize;
+        let val_end = val_start + value_len as usize;
+        Some((val_end, val_start, value_len as usize))
+    }
+
+    #[must_use]
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+
+    #[must_use]
+    pub const fn restart_offset(&self) -> usize {
+        self.restart_offset
+    }
+
+    #[must_use]
+    #[allow(dead_code)]
+    pub const fn num_restarts(&self) -> usize {
+        self.num_restarts
     }
 
     pub fn decode(data: Vec<u8>) -> Result<Self, &'static str> {
@@ -166,18 +201,15 @@ impl<'a> BlockIterator<'a> {
     }
 
     fn decode_entry_at(&mut self, offset: usize) {
-        let (shared_len, offset1) = Block::decode_varint(&self.block.data, offset);
-        let (unshared_len, offset2) = Block::decode_varint(&self.block.data, offset1);
-        let (value_len, offset3) = Block::decode_varint(&self.block.data, offset2);
-        let unshared_key = &self.block.data[offset3..offset3 + unshared_len as usize];
-        self.key.truncate(shared_len as usize);
-        self.key.extend_from_slice(unshared_key);
-        let val_start = offset3 + unshared_len as usize;
-        let val_end = val_start + value_len as usize;
-        self.value = &self.block.data[val_start..val_end];
-
-        self.offset = offset;
-        self.next_offset = val_end;
+        if let Some((next_offset, val_start, val_len)) = self.block.decode_entry(offset, &mut self.key) {
+            self.value = &self.block.data[val_start..val_start + val_len];
+            self.offset = offset;
+            self.next_offset = next_offset;
+        } else {
+            self.offset = self.block.restart_offset;
+            self.next_offset = self.block.restart_offset;
+            self.value = &[];
+        }
     }
 
     pub fn seek_to_first(&mut self) {
