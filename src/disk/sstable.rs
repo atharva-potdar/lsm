@@ -238,9 +238,9 @@ impl SsTableIterator {
             return Ok(false);
         }
         let handle = &self.block_handles[idx];
-        let block = self
-            .table
-            .read_block(handle.offset, handle.size, self.table.metrics.as_deref())?;
+        let block =
+            self.table
+                .read_block(handle.offset, handle.size, self.table.metrics.as_deref())?;
 
         self.current_block_idx = idx;
         self.offset = 0;
@@ -375,7 +375,8 @@ impl SsTable {
             m.bytes_read_disk.fetch_add(size, Ordering::Relaxed);
         }
         let block = Arc::new(
-            Block::decode(buf).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
+            Block::decode(buf)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
         );
 
         if let Some(ref cache) = self.block_cache {

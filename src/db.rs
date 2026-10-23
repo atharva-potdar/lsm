@@ -928,5 +928,75 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
-}
 
+    #[test]
+    fn test_telemetry_zero_absorption_distinct_keys() {
+        let temp_dir = std::env::temp_dir().join("lsm_test_telemetry_zero_absorption");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        // Small capacity (32KB) to trigger flushes into L0 and subsequent compactions
+        let db = DB::open(&temp_dir, 32 * 1024).unwrap();
+        let metrics = db.metrics();
+
+        // 1,000 distinct keys
+        for i in 0..1000 {
+            let k = format!("unique_key_{i:06}");
+            let v = vec![b'v'; 100];
+            db.put(k.as_bytes(), &v).unwrap();
+        }
+
+        db.force_flush().unwrap();
+        db.wait_for_compaction();
+
+        let entries_in = metrics.compaction_entries_in.load(Ordering::Relaxed);
+        let entries_out = metrics.compaction_entries_out.load(Ordering::Relaxed);
+
+        // All keys are distinct: zero entries should be dropped as duplicates!
+        assert!(entries_in > 0, "compaction must have processed entries");
+        assert_eq!(
+            entries_in, entries_out,
+            "distinct keys must have 0% absorption (entries_in == entries_out)"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_telemetry_heavy_absorption_same_key() {
+        let temp_dir = std::env::temp_dir().join("lsm_test_telemetry_heavy_absorption");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        // Small capacity (8KB) so 1,000 writes produce multiple L0 SSTables
+        let db = DB::open(&temp_dir, 8 * 1024).unwrap();
+        let metrics = db.metrics();
+
+        // Write the EXACT same key 1,000 times with different values
+        for i in 0..1000 {
+            let v = format!("value_version_{i:06}");
+            db.put(b"same_hot_key", v.as_bytes()).unwrap();
+        }
+
+        db.force_flush().unwrap();
+        db.wait_for_compaction();
+
+        let entries_in = metrics.compaction_entries_in.load(Ordering::Relaxed);
+        let entries_out = metrics.compaction_entries_out.load(Ordering::Relaxed);
+
+        assert!(
+            entries_in >= 1000,
+            "all 1000 versions must enter compaction, got {entries_in}"
+        );
+        // When merged, only the newest version per file/level survives!
+        assert!(
+            entries_out < entries_in / 10,
+            "identical key writes must collapse: entries_in={entries_in}, entries_out={entries_out}"
+        );
+        let dropped = entries_in - entries_out;
+        assert!(
+            dropped >= 900,
+            "at least 90% of duplicates should be incinerated, got {dropped}"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+}

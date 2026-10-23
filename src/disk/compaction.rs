@@ -173,6 +173,10 @@ impl Compactor {
         let mut last_user_key = Vec::new();
 
         while iter.is_valid() {
+            if let Some(ref m) = self.metrics {
+                m.compaction_entries_in
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             let internal_key = iter.key();
             if internal_key.len() < 9 {
                 iter.next();
@@ -209,6 +213,10 @@ impl Compactor {
                 min_key = internal_key.to_vec();
             }
 
+            if let Some(ref m) = self.metrics {
+                m.compaction_entries_out
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             current_writer
                 .as_mut()
                 .unwrap()
@@ -224,6 +232,10 @@ impl Compactor {
                 if let Some(ref m) = self.metrics {
                     m.bytes_written_compaction
                         .fetch_add(size, std::sync::atomic::Ordering::Relaxed);
+                    if output_level < m.compaction_bytes_by_level.len() {
+                        m.compaction_bytes_by_level[output_level]
+                            .fetch_add(size, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
                 let meta = FileMetaData {
                     file_id: current_file_id,
@@ -245,6 +257,10 @@ impl Compactor {
             if let Some(ref m) = self.metrics {
                 m.bytes_written_compaction
                     .fetch_add(size, std::sync::atomic::Ordering::Relaxed);
+                if output_level < m.compaction_bytes_by_level.len() {
+                    m.compaction_bytes_by_level[output_level]
+                        .fetch_add(size, std::sync::atomic::Ordering::Relaxed);
+                }
             }
             let meta = FileMetaData {
                 file_id: current_file_id,
@@ -441,5 +457,50 @@ mod tests {
         assert_eq!(job.inputs_level.len(), 4);
         assert_eq!(job.inputs_next_level.len(), 1);
         assert_eq!(job.inputs_next_level[0].file_id, 10);
+    }
+
+    #[test]
+    fn test_compaction_telemetry_entries_and_bytes() {
+        use std::sync::atomic::Ordering;
+
+        let temp_dir = std::env::temp_dir().join("lsm_test_compaction_telemetry");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let metrics = Arc::new(EngineMetrics::new());
+        let compactor = Compactor {
+            target_file_size: 4096,
+            work_dir: temp_dir.clone(),
+            block_size: 1024,
+            bloom_bits_per_key: 10,
+            metrics: Some(Arc::clone(&metrics)),
+            filter_policy: FilterPolicy::Static(10),
+        };
+
+        // 4 total inputs: 2 versions of k1, 1 tombstone of k2, 1 version of k3
+        let iter = TestIter::new(vec![
+            (encode_internal_key(b"k1", 10, 1), b"v1_new".to_vec()),
+            (encode_internal_key(b"k1", 5, 1), b"v1_old".to_vec()),
+            (encode_internal_key(b"k2", 20, 0), b"".to_vec()),
+            (encode_internal_key(b"k3", 15, 1), b"v3".to_vec()),
+        ]);
+
+        let merge_iter = MergeIterator::new(vec![iter]);
+        let mut next_file_id = 1;
+        // output_level = 2, is_bottom_level = true (tombstone dropped)
+        compactor
+            .compact(merge_iter, &mut next_file_id, 2, true)
+            .unwrap();
+
+        assert_eq!(metrics.compaction_entries_in.load(Ordering::Relaxed), 4);
+        // k1 kept, k1_old dropped, k2 tombstone dropped (bottom level), k3 kept => 2 out
+        assert_eq!(metrics.compaction_entries_out.load(Ordering::Relaxed), 2);
+        assert!(metrics.compaction_bytes_by_level[2].load(Ordering::Relaxed) > 0);
+        assert_eq!(
+            metrics.compaction_bytes_by_level[1].load(Ordering::Relaxed),
+            0
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

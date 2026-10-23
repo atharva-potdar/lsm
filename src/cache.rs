@@ -233,9 +233,18 @@ mod tests {
     fn test_sieve_cache_basic_and_scan_resistance() {
         let cache = SieveBlockCache::new(2);
 
-        let k1 = BlockId { sst_id: 1, offset: 0 };
-        let k2 = BlockId { sst_id: 1, offset: 100 };
-        let k3 = BlockId { sst_id: 2, offset: 0 };
+        let k1 = BlockId {
+            sst_id: 1,
+            offset: 0,
+        };
+        let k2 = BlockId {
+            sst_id: 1,
+            offset: 100,
+        };
+        let k3 = BlockId {
+            sst_id: 2,
+            offset: 0,
+        };
 
         let b1 = make_test_block(1);
         let b2 = make_test_block(2);
@@ -252,8 +261,14 @@ mod tests {
         // SIEVE hand should evict k2, keeping k1!
         cache.insert(k3.clone(), Arc::clone(&b3));
 
-        assert!(cache.get(&k1).is_some(), "k1 was visited and should be retained");
-        assert!(cache.get(&k2).is_none(), "k2 was single-touch and should be evicted");
+        assert!(
+            cache.get(&k1).is_some(),
+            "k1 was visited and should be retained"
+        );
+        assert!(
+            cache.get(&k2).is_none(),
+            "k2 was single-touch and should be evicted"
+        );
         assert!(cache.get(&k3).is_some(), "k3 was just inserted");
     }
 
@@ -261,9 +276,18 @@ mod tests {
     fn test_lru_cache_basic() {
         let cache = LruBlockCache::new(2);
 
-        let k1 = BlockId { sst_id: 1, offset: 0 };
-        let k2 = BlockId { sst_id: 1, offset: 100 };
-        let k3 = BlockId { sst_id: 2, offset: 0 };
+        let k1 = BlockId {
+            sst_id: 1,
+            offset: 0,
+        };
+        let k2 = BlockId {
+            sst_id: 1,
+            offset: 100,
+        };
+        let k3 = BlockId {
+            sst_id: 2,
+            offset: 0,
+        };
 
         let b1 = make_test_block(1);
         let b2 = make_test_block(2);

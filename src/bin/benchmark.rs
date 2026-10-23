@@ -1,7 +1,9 @@
 use clap::Parser;
 use lsm::cache::{BlockCache, LruBlockCache, SieveBlockCache};
 use lsm::db::{DB, FilterPolicy};
-use rand::RngExt;
+use rand::rngs::StdRng;
+use rand::seq::SliceRandom;
+use rand::{RngExt, SeedableRng};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -9,12 +11,24 @@ use std::time::Instant;
 #[derive(Parser, Debug)]
 #[command(
     name = "benchmark",
-    about = "LSM-RS Telemetry & Zipfian Workload Benchmark"
+    about = "LSM-RS Scientific Telemetry & Workload Benchmark"
 )]
 struct Args {
-    /// Total number of write operations to execute
+    /// Total number of write operations in measurement window
     #[arg(short = 'n', long, default_value_t = 1_000_000)]
     num_keys: usize,
+
+    /// Number of warmup keys to preload before measurement window (0 to disable)
+    #[arg(short = 'w', long, default_value_t = 0)]
+    warmup_keys: usize,
+
+    /// Total key space size (defaults to max(num_keys, warmup_keys))
+    #[arg(short = 'k', long)]
+    key_space: Option<usize>,
+
+    /// Random seed for Fisher-Yates rank scrambling and reproducibility
+    #[arg(long, default_value_t = 42)]
+    seed: u64,
 
     /// Zipfian skew parameter theta (0.0 = Uniform, 0.99 = Heavy Zipfian)
     #[arg(short = 's', long, default_value_t = 0.0)]
@@ -89,8 +103,8 @@ impl ZipfGenerator {
             sum += 1.0 / (i as f64).powf(theta);
         }
         if n > 10_000 {
-            sum += ((n as f64).powf(1.0 - theta) - (10_000.0_f64).powf(1.0 - theta))
-                / (1.0 - theta);
+            sum +=
+                ((n as f64).powf(1.0 - theta) - (10_000.0_f64).powf(1.0 - theta)) / (1.0 - theta);
         }
         sum
     }
@@ -111,21 +125,42 @@ impl ZipfGenerator {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+    let key_space = args
+        .key_space
+        .unwrap_or(args.num_keys.max(args.warmup_keys));
 
     println!("================================================================================");
-    println!("                    LSM-RS TELEMETRY & WORKLOAD BENCHMARK                       ");
+    println!("                    LSM-RS SCIENTIFIC TELEMETRY BENCHMARK                       ");
     println!("================================================================================");
     println!("Configuration:");
-    println!("  Operations:          {:>12}", format_number(args.num_keys));
-    println!("  Key Space:           {:>12} keys", format_number(args.num_keys));
-    println!("  Value Size:          {:>12} bytes", format_number(args.value_size));
     println!(
-        "  Distribution:        {:>12} (skew θ = {:.2})",
-        if args.skew == 0.0 { "Uniform" } else { "Zipfian" },
+        "  Measurement Operations: {:>12}",
+        format_number(args.num_keys)
+    );
+    println!(
+        "  Warmup Pre-load Keys:   {:>12}",
+        format_number(args.warmup_keys)
+    );
+    println!(
+        "  Key Space Size:         {:>12} keys",
+        format_number(key_space)
+    );
+    println!(
+        "  Value Size:             {:>12} bytes",
+        format_number(args.value_size)
+    );
+    println!("  Random Seed:            {:>12}", args.seed);
+    println!(
+        "  Distribution:           {:>12} (skew θ = {:.2})",
+        if args.skew == 0.0 {
+            "Uniform"
+        } else {
+            "Fisher-Yates Scrambled Zipf"
+        },
         args.skew
     );
     println!(
-        "  Filter Policy:       {:>12}",
+        "  Filter Policy:          {:>12}",
         if args.filter_policy.to_lowercase() == "monkey" {
             "Monkey (L0=20, L1=15, L2=10, L3+=5)"
         } else {
@@ -133,17 +168,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     );
     println!(
-        "  Block Cache:         {:>12} (capacity: {} blocks)",
+        "  Block Cache:            {:>12} (capacity: {} blocks)",
         args.cache_type.to_uppercase(),
         args.cache_capacity
     );
-    println!("  MemTable Capacity:   {:>12.2} MB", args.memtable_capacity as f64 / 1_048_576.0);
-    println!("  Working Directory:   {:>12?}", args.work_dir);
+    println!(
+        "  MemTable Capacity:      {:>12.2} MB",
+        args.memtable_capacity as f64 / 1_048_576.0
+    );
+    println!("  Working Directory:      {:>12?}", args.work_dir);
     println!("--------------------------------------------------------------------------------");
 
-    // Clean up previous runs
-    let _ = std::fs::remove_dir_all(&args.work_dir);
+    // 1. Directory Wiping: Guarantee a pristine environment
+    if args.work_dir.exists() {
+        std::fs::remove_dir_all(&args.work_dir)?;
+    }
     std::fs::create_dir_all(&args.work_dir)?;
+
+    // 2. Fisher-Yates Permutation: 1-to-1 bijection without Birthday Paradox hash collisions
+    println!(
+        "Generating Fisher-Yates permutation for {} keys (seed: {})...",
+        format_number(key_space),
+        args.seed
+    );
+    let mut permutation: Vec<u64> = (0..key_space as u64).collect();
+    let mut perm_rng = StdRng::seed_from_u64(args.seed);
+    permutation.shuffle(&mut perm_rng);
+
+    let get_key = |rank: u64| -> String {
+        let id = permutation[(rank as usize) % key_space];
+        format!("key_{id:08}")
+    };
 
     let policy = match args.filter_policy.to_lowercase().as_str() {
         "monkey" => FilterPolicy::Monkey,
@@ -156,42 +211,123 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => None,
     };
 
-    let db = DB::open_with_options(
-        &args.work_dir,
-        args.memtable_capacity,
-        policy,
-        block_cache,
-    )?;
+    let db = DB::open_with_options(&args.work_dir, args.memtable_capacity, policy, block_cache)?;
     let metrics = db.metrics();
+    let mut rng = rand::rng();
+    let value = vec![b'x'; args.value_size];
+
+    // =========================================================================
+    // PHASE 1: WARMUP PRE-POPULATION (STEADY STATE)
+    // =========================================================================
+    if args.warmup_keys > 0 {
+        println!(
+            "\n================================================================================"
+        );
+        println!(
+            "                         PHASE 1: STEADY-STATE WARMUP                           "
+        );
+        println!(
+            "================================================================================"
+        );
+        println!(
+            "Pre-populating tree with {} uniform keys across {} key space...",
+            format_number(args.warmup_keys),
+            format_number(key_space)
+        );
+
+        let warmup_start = Instant::now();
+        let report_interval = (args.warmup_keys / 10).max(1);
+
+        for i in 0..args.warmup_keys {
+            let rank = (i % key_space) as u64;
+            let key = get_key(rank);
+            db.put(key.as_bytes(), &value)?;
+
+            let op_idx = i + 1;
+            if op_idx % report_interval == 0 || op_idx == args.warmup_keys {
+                let pct = (op_idx as f64 / args.warmup_keys as f64) * 100.0;
+                let elapsed = warmup_start.elapsed().as_secs_f64();
+                let ops_sec = op_idx as f64 / elapsed;
+                print!(
+                    "\rWarmup Progress: [{:>6.1}%]  {:>10}/{:<10}  ({:>8.0} ops/sec)",
+                    pct, op_idx, args.warmup_keys, ops_sec
+                );
+                std::io::Write::flush(&mut std::io::stdout())?;
+            }
+        }
+        println!();
+
+        println!("Settling warmup writes and awaiting compaction cascade...");
+        db.force_flush()?;
+        db.wait_for_compaction();
+
+        let version = db.current_version();
+        println!("LSM-Tree Physical Hierarchy (Post-Warmup Steady State):");
+        for (lvl, files) in version.files.iter().enumerate() {
+            if !files.is_empty() {
+                let size: u64 = files.iter().map(|f| f.file_size).sum();
+                println!(
+                    "  Level {}: {:>3} files, {:>8.2} MB",
+                    lvl,
+                    files.len(),
+                    size as f64 / 1_048_576.0
+                );
+            }
+        }
+
+        println!("Resetting engine telemetry counters for isolated measurement window...");
+        metrics.reset();
+        println!("Telemetry reset complete.");
+    }
+
+    // =========================================================================
+    // PHASE 2: MEASUREMENT WINDOW
+    // =========================================================================
+    println!("\n================================================================================");
+    println!("                   MEASUREMENT WINDOW: WORKLOAD EXECUTION                       ");
+    println!("================================================================================");
+    println!(
+        "Executing {} writes (skew θ = {:.2}, key space = {} keys)...",
+        format_number(args.num_keys),
+        args.skew,
+        format_number(key_space)
+    );
 
     let zipf = if args.skew > 0.0 {
-        Some(ZipfGenerator::new(args.num_keys as u64, args.skew))
+        Some(ZipfGenerator::new(key_space as u64, args.skew))
     } else {
         None
     };
 
-    let mut rng = rand::rng();
-    let value = vec![b'x'; args.value_size];
+    let mut distinct_visited = vec![false; key_space];
+    let mut distinct_keys_count: usize = 0;
 
-    println!("Executing workload...");
     let start_time = Instant::now();
     let report_interval = (args.num_keys / 10).max(1);
 
     for i in 1..=args.num_keys {
-        let key_idx = if let Some(ref z) = zipf {
+        let rank = if let Some(ref z) = zipf {
             z.next(&mut rng)
         } else {
-            rng.random_range(0..args.num_keys as u64)
+            rng.random_range(0..key_space as u64)
         };
 
-        let key = format!("user_{:010}", key_idx * 2);
+        if (rank as usize) < key_space && !distinct_visited[rank as usize] {
+            distinct_visited[rank as usize] = true;
+            distinct_keys_count += 1;
+        }
+
+        let key = get_key(rank);
         db.put(key.as_bytes(), &value)?;
 
         if i % report_interval == 0 || i == args.num_keys {
             let pct = (i as f64 / args.num_keys as f64) * 100.0;
             let elapsed = start_time.elapsed().as_secs_f64();
             let ops_sec = i as f64 / elapsed;
-            print!("\rProgress: [{:>6.1}%]  {:>10}/{:<10}  ({:>8.0} ops/sec)", pct, i, args.num_keys, ops_sec);
+            print!(
+                "\rProgress: [{:>6.1}%]  {:>10}/{:<10}  ({:>8.0} ops/sec)",
+                pct, i, args.num_keys, ops_sec
+            );
             std::io::Write::flush(&mut std::io::stdout())?;
         }
     }
@@ -201,59 +337,160 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let write_ops_sec = args.num_keys as f64 / write_elapsed;
     let write_mb_sec = (metrics.user_bytes() as f64 / 1_048_576.0) / write_elapsed;
 
-    println!("\nWorkload completed in {:.2}s ({:.0} ops/sec, {:.2} MB/s user throughput).",
-             write_elapsed, write_ops_sec, write_mb_sec);
+    println!(
+        "\nWorkload window completed in {:.2}s ({:.0} ops/sec, {:.2} MB/s user throughput).",
+        write_elapsed, write_ops_sec, write_mb_sec
+    );
 
     println!("Flushing remaining active memtable and awaiting background compactions...");
-    let settle_start = Instant::now();
+    let comp_start = Instant::now();
     db.force_flush()?;
     db.wait_for_compaction();
-    let settle_elapsed = settle_start.elapsed().as_secs_f64();
-    println!("Tree settled in {:.2}s.", settle_elapsed);
+    let comp_elapsed = comp_start.elapsed().as_secs_f64();
+    println!("Compactions settled in {:.2}s.", comp_elapsed);
 
     let version = db.current_version();
-    println!("LSM-Tree Physical Hierarchy:");
+    let mut max_populated_level = 0;
+    println!("LSM-Tree Physical Hierarchy (Final):");
     for (lvl, files) in version.files.iter().enumerate() {
         if !files.is_empty() {
+            max_populated_level = lvl;
             let size: u64 = files.iter().map(|f| f.file_size).sum();
-            println!("  Level {}: {:>3} files, {:>8.2} MB", lvl, files.len(), size as f64 / 1_048_576.0);
+            println!(
+                "  Level {}: {:>3} files, {:>8.2} MB",
+                lvl,
+                files.len(),
+                size as f64 / 1_048_576.0
+            );
         }
     }
 
-    let total_elapsed = start_time.elapsed().as_secs_f64();
-
     let user_bytes = metrics.user_bytes();
-    let wal_bytes = metrics.bytes_written_wal.load(std::sync::atomic::Ordering::Relaxed);
-    let flush_bytes = metrics.bytes_written_flush.load(std::sync::atomic::Ordering::Relaxed);
-    let comp_bytes = metrics.bytes_written_compaction.load(std::sync::atomic::Ordering::Relaxed);
+    let wal_bytes = metrics
+        .bytes_written_wal
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let flush_bytes = metrics
+        .bytes_written_flush
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let comp_bytes = metrics
+        .bytes_written_compaction
+        .load(std::sync::atomic::Ordering::Relaxed);
     let total_disk = metrics.total_disk_bytes();
-    let wa = metrics.write_amplification();
+    let wa_no_wal = metrics.write_amplification();
+    let wa_with_wal = metrics.write_amplification_with_wal();
+
+    let entries_in = metrics
+        .compaction_entries_in
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let entries_out = metrics
+        .compaction_entries_out
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let entries_dropped = entries_in.saturating_sub(entries_out);
+    let drop_ratio = if entries_in > 0 {
+        entries_dropped as f64 / entries_in as f64 * 100.0
+    } else {
+        0.0
+    };
+
+    // Classical Leveled Compaction model prediction:
+    // WA_classical = 1 (flush) + (T / 2) * L_active
+    let t_multiplier = 10.0;
+    let classical_model_wa = 1.0 + (t_multiplier / 2.0) * (max_populated_level as f64);
 
     println!("--------------------------------------------------------------------------------");
     println!("Telemetry & Write Amplification:");
-    println!("  User Bytes Written:       {:>10.2} MB  ({} bytes)", user_bytes as f64 / 1_048_576.0, format_number(user_bytes as usize));
-    println!("  WAL Bytes Written:        {:>10.2} MB  ({} bytes)", wal_bytes as f64 / 1_048_576.0, format_number(wal_bytes as usize));
-    println!("  Flush Bytes Written:      {:>10.2} MB  ({} bytes)", flush_bytes as f64 / 1_048_576.0, format_number(flush_bytes as usize));
-    println!("  Compaction Bytes Written: {:>10.2} MB  ({} bytes)", comp_bytes as f64 / 1_048_576.0, format_number(comp_bytes as usize));
-    println!("  Total Disk Bytes Written: {:>10.2} MB  ({} bytes)", total_disk as f64 / 1_048_576.0, format_number(total_disk as usize));
+    println!(
+        "  Distinct Keys Written:    {:>10} / {} ({:.2}%)",
+        format_number(distinct_keys_count),
+        format_number(key_space),
+        (distinct_keys_count as f64 / key_space as f64) * 100.0
+    );
+    println!(
+        "  User Bytes Written:       {:>10.2} MB  ({} bytes)",
+        user_bytes as f64 / 1_048_576.0,
+        format_number(user_bytes as usize)
+    );
+    println!(
+        "  WAL Bytes Written:        {:>10.2} MB  ({} bytes)",
+        wal_bytes as f64 / 1_048_576.0,
+        format_number(wal_bytes as usize)
+    );
+    println!(
+        "  Flush Bytes Written:      {:>10.2} MB  ({} bytes)",
+        flush_bytes as f64 / 1_048_576.0,
+        format_number(flush_bytes as usize)
+    );
+    println!(
+        "  Compaction Bytes Total:   {:>10.2} MB  ({} bytes)",
+        comp_bytes as f64 / 1_048_576.0,
+        format_number(comp_bytes as usize)
+    );
+    for (lvl, bytes) in metrics.compaction_bytes_by_level.iter().enumerate() {
+        let b = bytes.load(std::sync::atomic::Ordering::Relaxed);
+        if b > 0 {
+            println!(
+                "    Level {} Output:        {:>10.2} MB  ({} bytes)",
+                lvl,
+                b as f64 / 1_048_576.0,
+                format_number(b as usize)
+            );
+        }
+    }
+    println!(
+        "  Total Disk Bytes Written: {:>10.2} MB  ({} bytes)",
+        total_disk as f64 / 1_048_576.0,
+        format_number(total_disk as usize)
+    );
     println!("--------------------------------------------------------------------------------");
-    println!("  Final Write Amplification (WA): {:.4}", wa);
-    println!("  Total Elapsed Time:             {:.2}s", total_elapsed);
+    println!("Overwrite Absorption Telemetry:");
+    println!(
+        "  Compaction Entries In:    {:>12}",
+        format_number(entries_in as usize)
+    );
+    println!(
+        "  Compaction Entries Out:   {:>12}",
+        format_number(entries_out as usize)
+    );
+    println!(
+        "  Entries Dropped (Merged): {:>12} ({:.2}% overwrite absorption)",
+        format_number(entries_dropped as usize),
+        drop_ratio
+    );
+    println!("--------------------------------------------------------------------------------");
+    println!("Model vs. Measured Write Amplification:");
+    println!("  Classical Model WA (T=10, L={max_populated_level}): {classical_model_wa:.2}");
+    println!("  Measured WA (excl. WAL):         {wa_no_wal:.4}");
+    println!("  Measured WA (incl. WAL):         {wa_with_wal:.4}");
+    println!("  Compaction Settle Time:          {comp_elapsed:.2}s");
     println!("================================================================================");
 
+    // =========================================================================
+    // OPTIONAL: GHOST READ-MISS BENCHMARK
+    // =========================================================================
     if args.read_misses > 0 {
-        println!("\n================================================================================");
-        println!("                    PHASE 2: GHOST READ-MISS BENCHMARK                          ");
-        println!("================================================================================");
-        println!("Executing {} ghost read-miss queries...", format_number(args.read_misses));
+        println!(
+            "\n================================================================================"
+        );
+        println!(
+            "                    PHASE 3: GHOST READ-MISS BENCHMARK                          "
+        );
+        println!(
+            "================================================================================"
+        );
+        println!(
+            "Executing {} ghost read-miss queries...",
+            format_number(args.read_misses)
+        );
 
-        metrics.bytes_read_disk.store(0, std::sync::atomic::Ordering::Relaxed);
+        metrics
+            .bytes_read_disk
+            .store(0, std::sync::atomic::Ordering::Relaxed);
         let read_start = Instant::now();
         let read_interval = (args.read_misses / 10).max(1);
 
         for i in 1..=args.read_misses {
-            let ghost_idx = rng.random_range(0..args.num_keys as u64);
-            let ghost_key = format!("user_{:010}", ghost_idx * 2 + 1);
+            let ghost_idx = rng.random_range(0..key_space as u64);
+            let ghost_key = format!("ghost_{ghost_idx:08}");
             let res = db.get(ghost_key.as_bytes())?;
             debug_assert!(res.is_none());
 
@@ -272,24 +509,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let read_elapsed = read_start.elapsed().as_secs_f64();
         let read_ops_sec = args.read_misses as f64 / read_elapsed;
-        let bytes_read = metrics.bytes_read_disk.load(std::sync::atomic::Ordering::Relaxed);
+        let bytes_read = metrics
+            .bytes_read_disk
+            .load(std::sync::atomic::Ordering::Relaxed);
         let mb_read = bytes_read as f64 / 1_048_576.0;
         let avg_bytes = bytes_read as f64 / args.read_misses as f64;
 
-        println!("--------------------------------------------------------------------------------");
+        println!(
+            "--------------------------------------------------------------------------------"
+        );
         println!("Ghost Read-Miss Results:");
-        println!("  Total Queries:            {:>12}", format_number(args.read_misses));
+        println!(
+            "  Total Queries:            {:>12}",
+            format_number(args.read_misses)
+        );
         println!("  Elapsed Time:             {:>12.2}s", read_elapsed);
         println!("  Read Throughput:          {:>12.0} ops/sec", read_ops_sec);
-        println!("  Disk Bytes Read:          {:>12.2} MB  ({} bytes)", mb_read, format_number(bytes_read as usize));
+        println!(
+            "  Disk Bytes Read:          {:>12.2} MB  ({} bytes)",
+            mb_read,
+            format_number(bytes_read as usize)
+        );
         println!("  Avg Disk Read per Query:  {:>12.2} bytes/op", avg_bytes);
-        println!("================================================================================");
+        println!(
+            "================================================================================"
+        );
     }
 
+    // =========================================================================
+    // OPTIONAL: COMPACTION CHURN & CACHE RETENTION BENCHMARK
+    // =========================================================================
     if args.churn_ops > 0 {
-        println!("\n================================================================================");
-        println!("               PHASE 3: COMPACTION CHURN & CACHE RETENTION BENCHMARK             ");
-        println!("================================================================================");
+        println!(
+            "\n================================================================================"
+        );
+        println!(
+            "               PHASE 4: COMPACTION CHURN & CACHE RETENTION BENCHMARK             "
+        );
+        println!(
+            "================================================================================"
+        );
         println!(
             "Workload: {} mixed operations ({}% reads / {}% writes) with {} cache ({} blocks)",
             format_number(args.churn_ops),
@@ -299,20 +558,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             args.cache_capacity
         );
 
-        metrics.cache_hits.store(0, std::sync::atomic::Ordering::Relaxed);
-        metrics.cache_misses.store(0, std::sync::atomic::Ordering::Relaxed);
+        metrics
+            .cache_hits
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        metrics
+            .cache_misses
+            .store(0, std::sync::atomic::Ordering::Relaxed);
 
         let churn_start = Instant::now();
         let churn_interval = (args.churn_ops / 10).max(1);
 
         for i in 1..=args.churn_ops {
             let is_read = rng.random_range(0.0..1.0) < args.read_ratio;
-            let key_idx = if let Some(ref z) = zipf {
+            let rank = if let Some(ref z) = zipf {
                 z.next(&mut rng)
             } else {
-                rng.random_range(0..args.num_keys as u64)
+                rng.random_range(0..key_space as u64)
             };
-            let key = format!("user_{:010}", key_idx * 2);
+            let key = get_key(rank);
 
             if is_read {
                 let _ = db.get(key.as_bytes())?;
@@ -324,8 +587,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let pct = (i as f64 / args.churn_ops as f64) * 100.0;
                 let elapsed = churn_start.elapsed().as_secs_f64();
                 let ops_sec = i as f64 / elapsed;
-                let hits = metrics.cache_hits.load(std::sync::atomic::Ordering::Relaxed);
-                let misses = metrics.cache_misses.load(std::sync::atomic::Ordering::Relaxed);
+                let hits = metrics
+                    .cache_hits
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let misses = metrics
+                    .cache_misses
+                    .load(std::sync::atomic::Ordering::Relaxed);
                 let ratio = if hits + misses > 0 {
                     hits as f64 / (hits + misses) as f64
                 } else {
@@ -333,7 +600,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 print!(
                     "\rChurn Progress: [{:>6.1}%]  {:>10}/{:<10}  ({:>8.0} ops/sec, hit ratio: {:.2}%)",
-                    pct, i, args.churn_ops, ops_sec, ratio * 100.0
+                    pct,
+                    i,
+                    args.churn_ops,
+                    ops_sec,
+                    ratio * 100.0
                 );
                 std::io::Write::flush(&mut std::io::stdout())?;
             }
@@ -345,8 +616,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         db.wait_for_compaction();
 
         let churn_elapsed = churn_start.elapsed().as_secs_f64();
-        let hits = metrics.cache_hits.load(std::sync::atomic::Ordering::Relaxed);
-        let misses = metrics.cache_misses.load(std::sync::atomic::Ordering::Relaxed);
+        let hits = metrics
+            .cache_hits
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let misses = metrics
+            .cache_misses
+            .load(std::sync::atomic::Ordering::Relaxed);
         let total_cache_lookups = hits + misses;
         let hit_ratio = if total_cache_lookups > 0 {
             (hits as f64 / total_cache_lookups as f64) * 100.0
@@ -354,19 +629,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             0.0
         };
 
-        println!("--------------------------------------------------------------------------------");
-        println!("Compaction Churn Results (Cache: {}):", args.cache_type.to_uppercase());
-        println!("  Total Mixed Operations:   {:>12}", format_number(args.churn_ops));
+        println!(
+            "--------------------------------------------------------------------------------"
+        );
+        println!(
+            "Compaction Churn Results (Cache: {}):",
+            args.cache_type.to_uppercase()
+        );
+        println!(
+            "  Total Mixed Operations:   {:>12}",
+            format_number(args.churn_ops)
+        );
         println!("  Elapsed Time:             {:>12.2}s", churn_elapsed);
-        println!("  Throughput:               {:>12.0} ops/sec", args.churn_ops as f64 / churn_elapsed);
-        println!("  Cache Hits:               {:>12}", format_number(hits as usize));
-        println!("  Cache Misses:             {:>12}", format_number(misses as usize));
+        println!(
+            "  Throughput:               {:>12.0} ops/sec",
+            args.churn_ops as f64 / churn_elapsed
+        );
+        println!(
+            "  Cache Hits:               {:>12}",
+            format_number(hits as usize)
+        );
+        println!(
+            "  Cache Misses:             {:>12}",
+            format_number(misses as usize)
+        );
         println!("  Cache Hit Ratio:          {:>11.2}%", hit_ratio);
-        println!("================================================================================");
+        println!(
+            "================================================================================"
+        );
     }
 
-    // Clean up
-    let _ = std::fs::remove_dir_all(&args.work_dir);
+    // Clean up directory at finish
+    if args.work_dir.exists() {
+        let _ = std::fs::remove_dir_all(&args.work_dir);
+    }
 
     Ok(())
 }
