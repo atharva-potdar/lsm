@@ -55,6 +55,10 @@ impl MemTable {
     pub fn approximate_size(&self) -> usize {
         self.approximate_size.load(Ordering::Relaxed)
     }
+
+    pub fn iter<'g>(&'g self, guard: &'g Guard) -> impl Iterator<Item = (&'g [u8], &'g [u8])> {
+        self.skip_list.iter(guard)
+    }
 }
 
 #[cfg(test)]

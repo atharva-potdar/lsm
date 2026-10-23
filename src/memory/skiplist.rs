@@ -67,6 +67,22 @@ impl SkipList {
         Some((next_node.key.as_slice(), next_node.value.as_slice()))
     }
 
+    pub fn iter<'g>(&'g self, guard: &'g Guard) -> impl Iterator<Item = (&'g [u8], &'g [u8])> {
+        let mut curr = self.head.load(Ordering::Acquire, guard);
+        std::iter::from_fn(move || {
+            // SAFETY: Nodes loaded under the active epoch guard are guaranteed to remain valid.
+            let node = unsafe { curr.as_ref()? };
+            let next = node.next[0].load(Ordering::Acquire, guard);
+            if next.is_null() {
+                return None;
+            }
+            curr = next;
+            // SAFETY: next was verified to be non-null and is protected by the epoch guard.
+            let next_node = unsafe { next.as_ref()? };
+            Some((next_node.key.as_slice(), next_node.value.as_slice()))
+        })
+    }
+
     pub fn put<'g>(&'g self, key: Vec<u8>, value: Vec<u8>, guard: &'g Guard) {
         let mut update: [crossbeam_epoch::Shared<SkipListNode>; 32] =
             [crossbeam_epoch::Shared::null(); 32];

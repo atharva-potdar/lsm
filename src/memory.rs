@@ -1,3 +1,5 @@
 pub mod core;
-mod memtable;
-mod skiplist;
+pub mod memtable;
+pub mod skiplist;
+
+
