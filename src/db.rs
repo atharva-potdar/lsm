@@ -20,6 +20,8 @@ use std::sync::mpsc::{self, Sender, SyncSender};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 
+pub use crate::disk::bloom::FilterPolicy;
+
 pub enum CompactionSignal {
     Check,
     Sync(SyncSender<()>),
@@ -43,13 +45,23 @@ pub struct DB {
     pub compaction_sender: Sender<CompactionSignal>,
     pub compaction_handle: Mutex<Option<JoinHandle<()>>>,
     pub metrics: Arc<EngineMetrics>,
+    pub filter_policy: FilterPolicy,
 }
 
 impl DB {
-    /// Opens the database, recovers from WAL if it exists, and initializes the `VersionSet`.
+    /// Opens the database with default `FilterPolicy::Static(10)`, recovers from WAL if it exists, and initializes the `VersionSet`.
     pub fn open(
         work_dir: impl Into<PathBuf>,
         memtable_capacity: usize,
+    ) -> std::io::Result<Arc<Self>> {
+        Self::open_with_policy(work_dir, memtable_capacity, FilterPolicy::Static(10))
+    }
+
+    /// Opens the database with a specified `FilterPolicy`.
+    pub fn open_with_policy(
+        work_dir: impl Into<PathBuf>,
+        memtable_capacity: usize,
+        filter_policy: FilterPolicy,
     ) -> std::io::Result<Arc<Self>> {
         let work_dir = work_dir.into();
         std::fs::create_dir_all(&work_dir)?;
@@ -106,6 +118,7 @@ impl DB {
             compaction_sender,
             compaction_handle: Mutex::new(None),
             metrics,
+            filter_policy,
         });
 
         let weak_db = Arc::downgrade(&db);
@@ -230,7 +243,7 @@ impl DB {
                 }
             };
 
-            match table.get(key, read_lsn)? {
+            match table.get_with_metrics(key, read_lsn, Some(&self.metrics))? {
                 ValueResult::Found(val) => return Ok(Some(val)),
                 ValueResult::Deleted => return Ok(None),
                 ValueResult::NotFound => {}
@@ -275,7 +288,7 @@ impl DB {
                         }
                     };
 
-                    match table.get(key, read_lsn)? {
+                    match table.get_with_metrics(key, read_lsn, Some(&self.metrics))? {
                         ValueResult::Found(val) => return Ok(Some(val)),
                         ValueResult::Deleted => return Ok(None),
                         ValueResult::NotFound => {}
@@ -301,9 +314,10 @@ impl DB {
 
         let file_id = self.next_file_id.fetch_add(1, Ordering::SeqCst);
 
+        let bits_per_key = self.filter_policy.bits_per_key_for_level(0);
         let sst_path = self.work_dir.join(format!("{file_id:06}.sst"));
         let file = File::create(&sst_path)?;
-        let mut writer = SSTableWriter::new(file, 4096, 16, 1, 10);
+        let mut writer = SSTableWriter::new(file, 4096, 16, 1, bits_per_key);
 
         let guard = crossbeam_epoch::pin();
         let mut min_key = Vec::new();
@@ -395,6 +409,7 @@ impl DB {
             block_size: 4096,
             bloom_bits_per_key: 10,
             metrics: Some(Arc::clone(&self.metrics)),
+            filter_policy: self.filter_policy,
         };
 
         loop {
@@ -863,6 +878,15 @@ mod tests {
         db.force_flush().unwrap();
         assert!(m.bytes_written_flush.load(Ordering::Relaxed) > 0);
         assert!(m.write_amplification() > 1.0);
+
+        let reads_before = m.disk_read_bytes();
+        assert_eq!(db.get(b"hello").unwrap(), Some(b"world".to_vec()));
+        assert!(m.disk_read_bytes() > reads_before);
+
+        let reads_after_hit = m.disk_read_bytes();
+        // A nonexistent key filtered by bloom should not trigger disk reads
+        assert_eq!(db.get(b"definitely_nonexistent_xyz_9999").unwrap(), None);
+        assert_eq!(m.disk_read_bytes(), reads_after_hit);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

@@ -9,8 +9,10 @@ use crate::disk::bloom::BloomFilter;
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::memory::core::{ValueResult, encode_internal_key};
+use crate::metrics::EngineMetrics;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
+use std::sync::atomic::Ordering;
 
 pub struct BlockHandle {
     pub offset: u64,
@@ -328,6 +330,15 @@ impl SsTable {
     }
 
     pub fn get(&self, user_key: &[u8], read_lsn: u64) -> std::io::Result<ValueResult> {
+        self.get_with_metrics(user_key, read_lsn, None)
+    }
+
+    pub fn get_with_metrics(
+        &self,
+        user_key: &[u8],
+        read_lsn: u64,
+        metrics: Option<&EngineMetrics>,
+    ) -> std::io::Result<ValueResult> {
         let hash = xxh3_64(user_key);
         if !self.filter.may_contain(hash) {
             return Ok(ValueResult::NotFound);
@@ -342,6 +353,9 @@ impl SsTable {
         let handle = BlockHandle::decode(iterator.value().unwrap()[0..16].try_into().unwrap());
         let mut buf = vec![0u8; handle.size as usize];
         self.file.read_exact_at(&mut buf, handle.offset)?;
+        if let Some(m) = metrics {
+            m.bytes_read_disk.fetch_add(handle.size, Ordering::Relaxed);
+        }
         let block = Block::decode(buf)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let mut iterator = BlockIterator::new(&block);

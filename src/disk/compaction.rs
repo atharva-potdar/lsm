@@ -117,6 +117,7 @@ impl CompactionPicker {
     }
 }
 
+use crate::disk::bloom::FilterPolicy;
 use crate::metrics::EngineMetrics;
 use std::sync::Arc;
 
@@ -126,6 +127,7 @@ pub struct Compactor {
     pub block_size: usize,
     pub bloom_bits_per_key: usize,
     pub metrics: Option<Arc<EngineMetrics>>,
+    pub filter_policy: FilterPolicy,
 }
 
 impl Compactor {
@@ -161,6 +163,7 @@ impl Compactor {
         let mut edit = VersionEdit::default();
 
         // State for the current SSTable being written
+        let bits_per_key = self.filter_policy.bits_per_key_for_level(output_level);
         let mut current_writer: Option<SSTableWriter<File>> = None;
         let mut current_file_id = 0;
         let mut min_key = Vec::new();
@@ -201,7 +204,7 @@ impl Compactor {
                     self.block_size,
                     16,
                     1,
-                    self.bloom_bits_per_key,
+                    bits_per_key,
                 ));
                 min_key = internal_key.to_vec();
             }
@@ -300,6 +303,7 @@ mod tests {
             block_size: 1024,
             bloom_bits_per_key: 10,
             metrics: None,
+            filter_policy: FilterPolicy::Static(10),
         };
 
         // Two versions of "key1": LSN 10 (newest) and LSN 5 (older)
@@ -360,6 +364,7 @@ mod tests {
             block_size: 1024,
             bloom_bits_per_key: 10,
             metrics: None,
+            filter_policy: FilterPolicy::Static(10),
         };
 
         // "key1" has tombstone at LSN 20, older version at LSN 5

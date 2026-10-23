@@ -65,6 +65,33 @@ impl BloomFilter {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterPolicy {
+    Static(usize),
+    Monkey,
+}
+
+impl Default for FilterPolicy {
+    fn default() -> Self {
+        Self::Static(10)
+    }
+}
+
+impl FilterPolicy {
+    #[must_use]
+    pub const fn bits_per_key_for_level(&self, level: usize) -> usize {
+        match self {
+            Self::Static(bits) => *bits,
+            Self::Monkey => match level {
+                0 => 20,
+                1 => 15,
+                2 => 10,
+                _ => 5,
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

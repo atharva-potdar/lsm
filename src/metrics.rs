@@ -6,6 +6,7 @@ pub struct EngineMetrics {
     pub bytes_written_wal: AtomicU64,
     pub bytes_written_flush: AtomicU64,
     pub bytes_written_compaction: AtomicU64,
+    pub bytes_read_disk: AtomicU64,
 }
 
 impl EngineMetrics {
@@ -27,6 +28,11 @@ impl EngineMetrics {
     }
 
     #[must_use]
+    pub fn disk_read_bytes(&self) -> u64 {
+        self.bytes_read_disk.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
     pub fn write_amplification(&self) -> f64 {
         let user = self.user_bytes() as f64;
         if user == 0.0 {
@@ -41,6 +47,7 @@ impl EngineMetrics {
         self.bytes_written_wal.store(0, Ordering::Relaxed);
         self.bytes_written_flush.store(0, Ordering::Relaxed);
         self.bytes_written_compaction.store(0, Ordering::Relaxed);
+        self.bytes_read_disk.store(0, Ordering::Relaxed);
     }
 }
 
