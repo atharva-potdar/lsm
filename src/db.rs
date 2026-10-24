@@ -48,6 +48,9 @@ pub struct DB {
     pub metrics: Arc<EngineMetrics>,
     pub filter_policy: FilterPolicy,
     pub block_cache: Option<Arc<dyn BlockCache>>,
+    pub target_file_size: usize,
+    pub base_level_size: u64,
+    pub l0_trigger: usize,
 }
 
 impl DB {
@@ -74,6 +77,27 @@ impl DB {
         memtable_capacity: usize,
         filter_policy: FilterPolicy,
         block_cache: Option<Arc<dyn BlockCache>>,
+    ) -> std::io::Result<Arc<Self>> {
+        Self::open_with_config(
+            work_dir,
+            memtable_capacity,
+            filter_policy,
+            block_cache,
+            2 * 1024 * 1024,
+            10 * 1024 * 1024,
+            4,
+        )
+    }
+
+    /// Opens the database with full configuration including compaction geometry.
+    pub fn open_with_config(
+        work_dir: impl Into<PathBuf>,
+        memtable_capacity: usize,
+        filter_policy: FilterPolicy,
+        block_cache: Option<Arc<dyn BlockCache>>,
+        target_file_size: usize,
+        base_level_size: u64,
+        l0_trigger: usize,
     ) -> std::io::Result<Arc<Self>> {
         let work_dir = work_dir.into();
         std::fs::create_dir_all(&work_dir)?;
@@ -132,6 +156,9 @@ impl DB {
             metrics,
             filter_policy,
             block_cache,
+            target_file_size,
+            base_level_size,
+            l0_trigger,
         });
 
         let weak_db = Arc::downgrade(&db);
@@ -425,9 +452,13 @@ impl DB {
     }
 
     pub fn run_compaction_loop(&self) -> std::io::Result<()> {
-        let picker = CompactionPicker::default();
+        let picker = CompactionPicker {
+            l0_trigger: self.l0_trigger,
+            base_level_size: self.base_level_size,
+            level_size_multiplier: 10,
+        };
         let compactor = Compactor {
-            target_file_size: 2 * 1024 * 1024,
+            target_file_size: self.target_file_size,
             work_dir: self.work_dir.clone(),
             block_size: 4096,
             bloom_bits_per_key: 10,
@@ -520,6 +551,45 @@ impl DB {
         {
             let _ = rx.recv();
         }
+    }
+
+    /// Drains any remaining files in Level 0 (even if < l0_trigger) by compacting them into Level 1,
+    /// and then running subsequent cascading compactions. Returns true if an L0 compaction was performed.
+    pub fn force_compact_l0(&self) -> std::io::Result<bool> {
+        let picker = CompactionPicker {
+            l0_trigger: self.l0_trigger,
+            base_level_size: self.base_level_size,
+            level_size_multiplier: 10,
+        };
+        let compactor = Compactor {
+            target_file_size: self.target_file_size,
+            work_dir: self.work_dir.clone(),
+            block_size: 4096,
+            bloom_bits_per_key: 10,
+            metrics: Some(Arc::clone(&self.metrics)),
+            filter_policy: self.filter_policy,
+        };
+
+        let version = self.current_version();
+        if let Some(job) = picker.pick_l0_compaction(&version) {
+            self.run_compaction_job(&compactor, &version, &job)?;
+            self.run_compaction_loop()?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Full Quiescence Drain:
+    /// Flushes the active memtable to L0, waits for compactions to settle,
+    /// and then drains any remaining files in Level 0 until Level 0 is completely empty.
+    pub fn quiesce(&self) -> std::io::Result<()> {
+        self.force_flush()?;
+        self.wait_for_compaction();
+        while self.force_compact_l0()? {
+            self.wait_for_compaction();
+        }
+        Ok(())
     }
 }
 

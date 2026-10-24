@@ -26,6 +26,14 @@ struct Args {
     #[arg(short = 'k', long)]
     key_space: Option<usize>,
 
+    /// Restricted key range for Uniform control arm (e.g. 63490 for Zipf-0.99 equivalent)
+    #[arg(long)]
+    uniform_range: Option<usize>,
+
+    /// Insert-only workload mode with zero overwrites (every write has a unique key)
+    #[arg(long, default_value_t = false)]
+    insert_only: bool,
+
     /// Random seed for Fisher-Yates rank scrambling and reproducibility
     #[arg(long, default_value_t = 42)]
     seed: u64,
@@ -41,6 +49,18 @@ struct Args {
     /// Memtable capacity in bytes
     #[arg(short = 'm', long, default_value_t = 4 * 1024 * 1024)]
     memtable_capacity: usize,
+
+    /// Target SSTable file size in bytes
+    #[arg(long, default_value_t = 2 * 1024 * 1024)]
+    target_file_size: usize,
+
+    /// Base level (L1) size threshold in bytes
+    #[arg(long, default_value_t = 10 * 1024 * 1024)]
+    base_level_size: u64,
+
+    /// Level 0 file count trigger to start compaction
+    #[arg(long, default_value_t = 4)]
+    l0_trigger: usize,
 
     /// Directory for LSM data files
     #[arg(short = 'd', long, default_value = "./benchmark_data")]
@@ -145,6 +165,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "  Key Space Size:         {:>12} keys",
         format_number(key_space)
     );
+    if let Some(range) = args.uniform_range {
+        println!(
+            "  Uniform Control Range:  {:>12} keys ({:.2}% of key space)",
+            format_number(range),
+            (range as f64 / key_space as f64) * 100.0
+        );
+    }
     println!(
         "  Value Size:             {:>12} bytes",
         format_number(args.value_size)
@@ -152,8 +179,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Random Seed:            {:>12}", args.seed);
     println!(
         "  Distribution:           {:>12} (skew θ = {:.2})",
-        if args.skew == 0.0 {
-            "Uniform"
+        if args.insert_only {
+            "Insert-Only (Zero Overwrites)"
+        } else if args.skew == 0.0 {
+            if args.uniform_range.is_some() {
+                "Restricted Uniform Control"
+            } else {
+                "Uniform"
+            }
         } else {
             "Fisher-Yates Scrambled Zipf"
         },
@@ -176,6 +209,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "  MemTable Capacity:      {:>12.2} MB",
         args.memtable_capacity as f64 / 1_048_576.0
     );
+    println!(
+        "  Target SSTable Size:    {:>12.2} MB",
+        args.target_file_size as f64 / 1_048_576.0
+    );
+    println!(
+        "  Base Level (L1) Size:   {:>12.2} MB",
+        args.base_level_size as f64 / 1_048_576.0
+    );
+    println!("  L0 Compaction Trigger:  {:>12} files", args.l0_trigger);
     println!("  Working Directory:      {:>12?}", args.work_dir);
     println!("--------------------------------------------------------------------------------");
 
@@ -211,10 +253,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => None,
     };
 
-    let db = DB::open_with_options(&args.work_dir, args.memtable_capacity, policy, block_cache)?;
+    let db = DB::open_with_config(
+        &args.work_dir,
+        args.memtable_capacity,
+        policy,
+        block_cache,
+        args.target_file_size,
+        args.base_level_size,
+        args.l0_trigger,
+    )?;
     let metrics = db.metrics();
     let mut rng = rand::rng();
     let value = vec![b'x'; args.value_size];
+
+    let mut dynamic_model_wa = 1.0;
 
     // =========================================================================
     // PHASE 1: WARMUP PRE-POPULATION (STEADY STATE)
@@ -257,9 +309,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         println!();
 
-        println!("Settling warmup writes and awaiting compaction cascade...");
-        db.force_flush()?;
-        db.wait_for_compaction();
+        println!(
+            "Full Quiescence Drain: Flushing warmup memtable and settling all compaction debt..."
+        );
+        let warmup_drain_start = Instant::now();
+        db.quiesce()?;
+        println!(
+            "Warmup fully quiesced in {:.2}s.",
+            warmup_drain_start.elapsed().as_secs_f64()
+        );
 
         let version = db.current_version();
         println!("LSM-Tree Physical Hierarchy (Post-Warmup Steady State):");
@@ -274,6 +332,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         }
+
+        // Calculate dynamic geometry-aware model WA from actual post-warmup level sizes:
+        // WA = 1 (flush) + sum_{lvl=1..L} 0.5 * min(T, size(lvl+1) / size(lvl))
+        let t_multiplier = 10.0;
+        let mut model_sum = 1.0;
+        for lvl in 1..version.files.len() - 1 {
+            let s_curr: u64 = version.files[lvl].iter().map(|f| f.file_size).sum();
+            let s_next: u64 = version.files[lvl + 1].iter().map(|f| f.file_size).sum();
+            if s_curr > 0 {
+                let effective_fanout = (s_next as f64 / s_curr as f64).min(t_multiplier);
+                model_sum += effective_fanout / 2.0;
+            }
+        }
+        dynamic_model_wa = model_sum;
 
         println!("Resetting engine telemetry counters for isolated measurement window...");
         metrics.reset();
@@ -299,6 +371,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    let get_key = |i: u64, rank: u64| -> String {
+        if args.insert_only {
+            // Guarantee no overwrites by offsetting past the warmup keys
+            format!("key_{:08}", args.warmup_keys as u64 + i)
+        } else if let Some(range) = args.uniform_range {
+            let id = permutation[(rank as usize) % range];
+            format!("key_{:08}", id)
+        } else {
+            let id = permutation[(rank as usize) % key_space];
+            format!("key_{:08}", id)
+        }
+    };
+
     let mut distinct_visited = vec![false; key_space];
     let mut distinct_keys_count: usize = 0;
 
@@ -306,18 +391,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let report_interval = (args.num_keys / 10).max(1);
 
     for i in 1..=args.num_keys {
-        let rank = if let Some(ref z) = zipf {
+        let rank = if args.insert_only {
+            0
+        } else if let Some(ref z) = zipf {
             z.next(&mut rng)
+        } else if let Some(u_range) = args.uniform_range {
+            rng.random_range(0..u_range.min(key_space) as u64)
         } else {
             rng.random_range(0..key_space as u64)
         };
 
-        if (rank as usize) < key_space && !distinct_visited[rank as usize] {
+        if args.insert_only {
+            distinct_keys_count += 1;
+        } else if (rank as usize) < key_space && !distinct_visited[rank as usize] {
             distinct_visited[rank as usize] = true;
             distinct_keys_count += 1;
         }
 
-        let key = get_key(rank);
+        let key = get_key(i as u64, rank);
         db.put(key.as_bytes(), &value)?;
 
         if i % report_interval == 0 || i == args.num_keys {
@@ -342,16 +433,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         write_elapsed, write_ops_sec, write_mb_sec
     );
 
-    println!("Flushing remaining active memtable and awaiting background compactions...");
+    println!("Full Quiescence Drain: Flushing active memtable and draining all compaction debt...");
     let comp_start = Instant::now();
-    db.force_flush()?;
-    db.wait_for_compaction();
+    db.quiesce()?;
     let comp_elapsed = comp_start.elapsed().as_secs_f64();
-    println!("Compactions settled in {:.2}s.", comp_elapsed);
+    println!(
+        "Tree fully quiesced with zero L0 debt in {:.2}s.",
+        comp_elapsed
+    );
 
     let version = db.current_version();
     let mut max_populated_level = 0;
-    println!("LSM-Tree Physical Hierarchy (Final):");
+    println!("LSM-Tree Physical Hierarchy (Final Steady State):");
     for (lvl, files) in version.files.iter().enumerate() {
         if !files.is_empty() {
             max_populated_level = lvl;
@@ -392,18 +485,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         0.0
     };
 
-    // Classical Leveled Compaction model prediction:
-    // WA_classical = 1 (flush) + (T / 2) * L_active
+    // Classical nominal leveled compaction formula: 1 + (T / 2) * L_active
     let t_multiplier = 10.0;
     let classical_model_wa = 1.0 + (t_multiplier / 2.0) * (max_populated_level as f64);
 
     println!("--------------------------------------------------------------------------------");
     println!("Telemetry & Write Amplification:");
+    let total_distinct_denom = if args.insert_only {
+        args.num_keys
+    } else {
+        key_space
+    };
     println!(
         "  Distinct Keys Written:    {:>10} / {} ({:.2}%)",
         format_number(distinct_keys_count),
-        format_number(key_space),
-        (distinct_keys_count as f64 / key_space as f64) * 100.0
+        format_number(total_distinct_denom),
+        (distinct_keys_count as f64 / total_distinct_denom as f64) * 100.0
     );
     println!(
         "  User Bytes Written:       {:>10.2} MB  ({} bytes)",
@@ -415,29 +512,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         wal_bytes as f64 / 1_048_576.0,
         format_number(wal_bytes as usize)
     );
+    println!("--------------------------------------------------------------------------------");
+    println!("Level Breakdown (Disk Write Activity):");
     println!(
-        "  Flush Bytes Written:      {:>10.2} MB  ({} bytes)",
+        "  Level 0 (Flush Output):     {:>10.2} MB  ({} bytes)",
         flush_bytes as f64 / 1_048_576.0,
         format_number(flush_bytes as usize)
     );
+    for lvl in 1..=4 {
+        let b = if lvl < metrics.compaction_bytes_by_level.len() {
+            metrics.compaction_bytes_by_level[lvl].load(std::sync::atomic::Ordering::Relaxed)
+        } else {
+            0
+        };
+        println!(
+            "  Level {} (Compaction Output):{:>10.2} MB  ({} bytes)",
+            lvl,
+            b as f64 / 1_048_576.0,
+            format_number(b as usize)
+        );
+    }
     println!(
-        "  Compaction Bytes Total:   {:>10.2} MB  ({} bytes)",
+        "  Total Compaction Output:    {:>10.2} MB  ({} bytes)",
         comp_bytes as f64 / 1_048_576.0,
         format_number(comp_bytes as usize)
     );
-    for (lvl, bytes) in metrics.compaction_bytes_by_level.iter().enumerate() {
-        let b = bytes.load(std::sync::atomic::Ordering::Relaxed);
-        if b > 0 {
-            println!(
-                "    Level {} Output:        {:>10.2} MB  ({} bytes)",
-                lvl,
-                b as f64 / 1_048_576.0,
-                format_number(b as usize)
-            );
-        }
-    }
     println!(
-        "  Total Disk Bytes Written: {:>10.2} MB  ({} bytes)",
+        "  Total Disk Bytes Written:   {:>10.2} MB  ({} bytes)",
         total_disk as f64 / 1_048_576.0,
         format_number(total_disk as usize)
     );
@@ -458,10 +559,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!("--------------------------------------------------------------------------------");
     println!("Model vs. Measured Write Amplification:");
-    println!("  Classical Model WA (T=10, L={max_populated_level}): {classical_model_wa:.2}");
-    println!("  Measured WA (excl. WAL):         {wa_no_wal:.4}");
-    println!("  Measured WA (incl. WAL):         {wa_with_wal:.4}");
-    println!("  Compaction Settle Time:          {comp_elapsed:.2}s");
+    println!(
+        "  Classical Nominal Model WA (T=10, L={max_populated_level}): {:.2}",
+        classical_model_wa
+    );
+    println!(
+        "  Dynamic Geometry-Aware Model WA:            {:.2}",
+        dynamic_model_wa
+    );
+    println!(
+        "  Measured WA (excl. WAL):                    {:.4}",
+        wa_no_wal
+    );
+    println!(
+        "  Measured WA (incl. WAL):                    {:.4}",
+        wa_with_wal
+    );
+    println!(
+        "  Compaction Settle Time (Full Drain):        {:.2}s",
+        comp_elapsed
+    );
     println!("================================================================================");
 
     // =========================================================================
@@ -572,10 +689,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let is_read = rng.random_range(0.0..1.0) < args.read_ratio;
             let rank = if let Some(ref z) = zipf {
                 z.next(&mut rng)
+            } else if let Some(u_range) = args.uniform_range {
+                rng.random_range(0..u_range.min(key_space) as u64)
             } else {
                 rng.random_range(0..key_space as u64)
             };
-            let key = get_key(rank);
+            let key = get_key(i as u64, rank);
 
             if is_read {
                 let _ = db.get(key.as_bytes())?;
@@ -611,9 +730,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         println!();
 
-        // Settle remaining writes and wait for compactions
-        db.force_flush()?;
-        db.wait_for_compaction();
+        // Full quiescence drain
+        db.quiesce()?;
 
         let churn_elapsed = churn_start.elapsed().as_secs_f64();
         let hits = metrics

@@ -115,6 +115,46 @@ impl CompactionPicker {
 
         None
     }
+
+    /// For full quiescence drain: picks any remaining files in Level 0 (even if < l0_trigger) to merge into Level 1.
+    #[must_use]
+    pub fn pick_l0_compaction(&self, version: &Version) -> Option<CompactionJob> {
+        let num_levels = version.files.len();
+        if num_levels < 2 || version.files[0].is_empty() {
+            return None;
+        }
+
+        let inputs_level = version.files[0].clone();
+        let mut min_u = None;
+        let mut max_u = None;
+
+        for f in &inputs_level {
+            let f_min = user_key(&f.min_key);
+            let f_max = user_key(&f.max_key);
+            if min_u.is_none() || f_min < min_u.unwrap() {
+                min_u = Some(f_min);
+            }
+            if max_u.is_none() || f_max > max_u.unwrap() {
+                max_u = Some(f_max);
+            }
+        }
+
+        let mut inputs_next_level = Vec::new();
+        if let (Some(min_u), Some(max_u)) = (min_u, max_u) {
+            for f in &version.files[1] {
+                if files_overlap(f, min_u, max_u) {
+                    inputs_next_level.push(f.clone());
+                }
+            }
+        }
+
+        Some(CompactionJob {
+            input_level: 0,
+            output_level: 1,
+            inputs_level,
+            inputs_next_level,
+        })
+    }
 }
 
 use crate::disk::bloom::FilterPolicy;
